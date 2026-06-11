@@ -6,6 +6,9 @@ export const useAppStore = defineStore("app", () => {
   const viewVideo = ref(true);
   const darkThemeEnabled = ref(false);
 
+  // Mag characterization model (v2 JSON from configurator wizard)
+  const magCharacterizationModel = ref(null);
+
   // Filename of loaded log (pushed from legacy code)
   const logFilename = ref("");
 
@@ -71,6 +74,7 @@ export const useAppStore = defineStore("app", () => {
     newGraphConfig,
     exportCsv,
     exportGpx,
+    exportKml: shallowRef(null),
     exportWorkspaces,
     openNewWindow,
     pauseForExport,
@@ -78,6 +82,8 @@ export const useAppStore = defineStore("app", () => {
     saveVideoConfig,
     saveUserSettings,
     refreshGraph,
+    magCharacterizationModel,
+    loadMagModel: shallowRef(null),
     setLegendHidden,
     setViewVideo,
   };

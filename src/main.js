@@ -16,7 +16,8 @@ import {
 import { restorePenDefaults, changePenSmoothing, changePenZoom, changePenExpo } from "./pen_adjustment.js";
 import { createKeydownHandler } from "./keyboard_handler.js";
 import { upgradeWorkspaceFormat, saveWorkspaces, loadWorkspaces } from "./workspace_io.js";
-import { exportCsv, exportGpx, exportSpectrumToCsv } from "./export_utils.js";
+import { exportCsv, exportGpx, exportSpectrumToCsv, exportKml } from "./export_utils.js";
+import { loadMagCharacterizationModel } from "./mag_model.js";
 import { syncLogToVideo, setVideoOffset, setVideoTime, setVideoInTime, setVideoOutTime, loadVideo, reportVideoError } from "./video_handler.js";
 import { renderLogFileInfo, renderSelectedLogInfo, setSeekBarMode } from "./log_lifecycle.js";
 import { invalidateGraph, updateCanvasSize, setGraphState, setCurrentBlackboxTime, setPlaybackRate, setGraphZoom, showConfigFile, showValueTable, logJumpBack, logJumpForward, logJumpStart, logJumpEnd, logPlayPause, setMarker, logSyncHere, logSyncBack, logSyncForward, logSmartSync, videoLoaded } from "./playback_controls.js";
@@ -647,6 +648,37 @@ function BlackboxLogViewer() {
   appStore.exportGpx = () => {
     setGraphState(GRAPH_STATE_PAUSED);
     exportGpx(logStore.flightLog, appStore.logFilename);
+  };
+  appStore.exportKml = () => {
+    setGraphState(GRAPH_STATE_PAUSED);
+    exportKml(logStore.flightLog, appStore.logFilename, null, appStore.magCharacterizationModel);
+  };
+  appStore.loadMagModel = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const json = JSON.parse(ev.target.result);
+          const result = loadMagCharacterizationModel(json);
+          if (result.valid) {
+            appStore.magCharacterizationModel = result.model;
+            console.log("Mag characterization model loaded:", result.model.ellipsoid);
+          } else {
+            alert("Invalid mag model: " + (result.error || "unknown error"));
+          }
+        } catch (err) {
+          alert("Failed to parse mag model JSON: " + err.message);
+        }
+      };
+      reader.readAsText(file);
+      e.target.value = "";
+    };
+    input.click();
   };
   appStore.exportWorkspaces = () => {
     setGraphState(GRAPH_STATE_PAUSED);

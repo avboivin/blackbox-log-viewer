@@ -1,6 +1,7 @@
 import { triggerDownload } from "./tools.js";
 import { CsvExporter } from "./csv-exporter.js";
 import { GpxExporter } from "./gpx-exporter.js";
+import { KmlExporter } from "./kml-exporter.js";
 
 function createExportCallback(fileExtension, fileType, file, startTime, logFilename) {
   return function (data) {
@@ -37,4 +38,9 @@ export function exportSpectrumToCsv(analyser, logFilename, options = {}) {
 
   const onSuccess = createExportCallback("csv", "text/csv", fileName, performance.now(), logFilename);
   analyser.exportSpectrumToCSV(onSuccess, options);
+}
+
+export function exportKml(flightLog, logFilename, file, magModel = null) {
+  const onSuccess = createExportCallback("kml", "application/vnd.google-earth.kml+xml", file, performance.now(), logFilename);
+  new KmlExporter(flightLog, magModel).dump(onSuccess);
 }
