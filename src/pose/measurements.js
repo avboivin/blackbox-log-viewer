@@ -177,13 +177,13 @@ export function createBaroFactor(baroAlt, baroOffset, sigma = 1.0) {
     return -x.p[2] + baroOffset;
   }
 
-  // H = [0, 0, -1,  0, 0, 0,  0, 0, 0] — only D component of position
-  const H = [0, 0, -1, 0, 0, 0, 0, 0, 0];
+  // H = [[0, 0, -1,  0, 0, 0,  0, 0, 0]] — only D component of position
+  const H = [[0, 0, -1, 0, 0, 0, 0, 0, 0]];
 
   const R = [[varZ]];
 
   function residual(z, x) {
-    return z - h(x);
+    return [z - h(x)];
   }
 
   return { h, H, R, residual };
@@ -226,6 +226,107 @@ export function createQuaternionPrior(qMeas, sigma = 0.1) {
   }
 
   return { h, H, R, residual };
+}
+
+/**
+ * 3-axis magnetometer measurement (body frame, in Gauss).
+ *
+ * Measurement model: z_mag = R(q)^T · m_earth + m_body
+ *
+ * H rows are 15-element for the 9-base + 6-mag state.
+ *
+ * @param {number[]} meas   - mag reading [bx,by,bz] body FRD (Gauss)
+ * @param {number}   sigma  - measurement noise 1σ (Gauss)
+ * @returns {object} factor
+ */
+export function createMagFactor(meas, sigma = 0.05) {
+    const varM = sigma * sigma;
+    const Rnoise = [[varM, 0, 0], [0, varM, 0], [0, 0, varM]];
+
+    // Internal quaternion to rotation helpers (local copy to avoid import)
+    function q2r(q) {
+        const [w,x,y,z] = q;
+        const xx=x*x, yy=y*y, zz=z*z, xy=x*y, xz=x*z, yz=y*z, wx=w*x, wy=w*y, wz=w*z;
+        return [
+            1-2*(yy+zz), 2*(xy+wz), 2*(xz-wy),
+            2*(xy-wz), 1-2*(xx+zz), 2*(yz+wx),
+            2*(xz+wy), 2*(yz-wx), 1-2*(xx+yy),
+        ];
+    }
+
+    let cachedH = null;
+
+    function h(x) {
+        const m = q2r(x.q);
+        const me = x.mEarth || [0,0,0];
+        const mb = x.mBody || [0,0,0];
+        // R^T = transposed rotation; but m is row-major body→world, so R^T is column access
+        return [
+            m[0]*me[0] + m[3]*me[1] + m[6]*me[2] + mb[0],
+            m[1]*me[0] + m[4]*me[1] + m[7]*me[2] + mb[1],
+            m[2]*me[0] + m[5]*me[1] + m[8]*me[2] + mb[2],
+        ];
+    }
+
+    function residual(z, x) {
+        const m = q2r(x.q);
+        const me = x.mEarth || [0,0,0];
+        // mEarth in body frame = R^T * mEarth
+        const meBx = m[0]*me[0] + m[3]*me[1] + m[6]*me[2];
+        const meBy = m[1]*me[0] + m[4]*me[1] + m[7]*me[2];
+        const meBz = m[2]*me[0] + m[5]*me[1] + m[8]*me[2];
+
+        // ∂h/∂θ = skew(mEarth_body)
+        cachedH = [
+            [0,0,0, 0,0,0, 0,-meBz,meBy, m[0],m[3],m[6], 1,0,0],
+            [0,0,0, 0,0,0, meBz,0,-meBx, m[1],m[4],m[7], 0,1,0],
+            [0,0,0, 0,0,0, -meBy,meBx,0, m[2],m[5],m[8], 0,0,1],
+        ];
+        const hp = h(x);
+        return [z[0]-hp[0], z[1]-hp[1], z[2]-hp[2]];
+    }
+
+    return {
+        h,
+        get H() { return cachedH || [[0,0,0,0,0,0,0,0,0,0,0,0,1,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,1,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]]; },
+        R: Rnoise,
+        residual,
+    };
+}
+
+/**
+ * Declination pseudo-measurement.
+ *
+ * Soft constraint: atan2(magE, magN) ≈ WMM_declination (radians).
+ * Keeps the earth field vector from drifting.
+ *
+ * @param {number} declRad - WMM declination at flight location (radians)
+ * @param {number} [sigma=0.34] - noise in radians
+ */
+export function createDeclinationFactor(declRad, sigma = 0.34) {
+    const varD = sigma * sigma;
+    let cachedH = null;
+
+    function h(x) {
+        const me = x.mEarth || [0,0,0];
+        return Math.atan2(me[1], me[0]);
+    }
+
+    function residual(z, x) {
+        const me = x.mEarth || [0,0,0];
+        const n2e2 = me[0]*me[0] + me[1]*me[1];
+        const dHdN = n2e2 > 1e-12 ? -me[1]/n2e2 : 0;
+        const dHdE = n2e2 > 1e-12 ? me[0]/n2e2 : 0;
+        cachedH = [[0,0,0,0,0,0,0,0,0, dHdN,dHdE,0, 0,0,0]];
+        return [z - h(x)];
+    }
+
+    return {
+        h,
+        get H() { return cachedH || [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]; },
+        R: [[varD]],
+        residual,
+    };
 }
 
 /**
