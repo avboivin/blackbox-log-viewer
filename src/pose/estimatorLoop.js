@@ -8,7 +8,7 @@
  */
 
 import { createEskf, eskfPredict, eskfUpdate } from "./eskf.js";
-import { createGpsPositionFactor, createGpsVelocityFactor, createBaroFactor, createQuaternionPrior } from "./measurements.js";
+import { createGpsPositionFactor, createGpsVelocityFactor, createBaroFactor, createQuaternionPrior, createMagFactor, createDeclinationFactor } from "./measurements.js";
 import { rtsSmooth } from "./rtsSmoother.js";
 import { llhToNed, nedToLlh } from "./geodesy.js";
 
@@ -20,6 +20,7 @@ import { llhToNed, nedToLlh } from "./geodesy.js";
  * @param {Array<{tUs:number, lat:number, lon:number, alt:number, velNed:[3]?}>} data.gps - sorted GPS fixes
  * @param {Array<{tUs:number, alt:number}>} data.baro - sorted baro samples
  * @param {Array<{tUs:number, q:[4]}>} data.quat - sorted FC quaternion samples
+ * @param {Array<{tUs:number, meas:[3]}>} [data.mag] - sorted 3-axis mag samples (body FRD, Gauss)
  * @param {object} origin - {lat, lon, alt} NED origin (first GPS home)
  * @param {object} [opts]
  * @param {number} [opts.outputHz=20] - keyframe output rate
@@ -27,7 +28,9 @@ import { llhToNed, nedToLlh } from "./geodesy.js";
  * @param {number} [opts.gpsVelSigma=0.5]
  * @param {number} [opts.baroSigma=1.0]
  * @param {number} [opts.attSigma=0.1]
- * @param {number} [opts.maxIter=3]
+ * @param {number} [opts.magSigma=0.05] - mag measurement noise 1σ (Gauss)
+ * @param {number} [opts.declSigma=0.34] - declination constraint 1σ (rad)
+ * @param {object} [opts.magModel] - fusion block from mag characterization model
  * @returns {Array<{tMs:number, lat:number, lon:number, altMsl:number, q:[4], vNed:[3], sigmaPos:number, sigmaAtt:number}>}
  */
 export function estimatePoses(data, origin, opts = {}) {
@@ -38,9 +41,12 @@ export function estimatePoses(data, origin, opts = {}) {
         baroSigma = 1.0,
         attSigma = 0.1,
         maxIter = 3,
+        magSigma = 0.05,
+        declSigma = 0.34,
+        magModel = null,
     } = opts;
 
-    const { imu, gps, baro, quat } = data;
+    const { imu, gps, baro, quat, mag } = data;
     if (!imu || imu.length === 0) return [];
 
     const { lat: lat0, lon: lon0, alt: alt0 } = origin;
@@ -76,14 +82,28 @@ export function estimatePoses(data, origin, opts = {}) {
 
     // ---- Build keyframe schedule ----
     const outputIntervalUs = 1e6 / outputHz;
+    const hasMag = magModel && magModel.earthFieldNedGauss && mag && mag.length > 0;
+    const useMag = hasMag && magModel.qualityBounds?.bounds_ok !== false;
     let poses = [];
 
+    // Mag noise from model or default
+    const magMeasSigma = useMag && magModel.magNoiseGauss?.sigma != null
+        ? magModel.magNoiseGauss.sigma
+        : magSigma;
+
     for (let iter = 0; iter < maxIter; iter++) {
-        const eskf = createEskf({ p0, v0, q0, sigmaPos: 5, sigmaVel: 2, sigmaAtt: 0.2 });
+        const eskfOpts = { p0, v0, q0, sigmaPos: 5, sigmaVel: 2, sigmaAtt: 0.2 };
+        if (useMag) {
+            const me = magModel.earthFieldNedGauss;
+            eskfOpts.mEarth0 = [me.n, me.e, me.d];
+            eskfOpts.mBody0 = [0, 0, 0];
+        }
+        const eskf = createEskf(eskfOpts);
         const steps = [];
         let gpsIdx = 0;
         let baroIdx = 0;
         let quatIdx = 0;
+        let magIdx = 0;
 
         let imuIdx = 0;
         let nextKfUs = imu[0].tUs + outputIntervalUs;
@@ -141,6 +161,25 @@ export function estimatePoses(data, origin, opts = {}) {
                     const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
                     if (eskfUpdate(eskf, fQ, quat[quatIdx].q)) hasUpdate = true;
                     quatIdx++;
+                }
+
+                // 3-axis mag update (gate 3.0 per 09 §1)
+                if (useMag) {
+                    while (magIdx < mag.length && mag[magIdx].tUs <= nextKfUs) {
+                        const fM = createMagFactor(mag[magIdx].meas, magMeasSigma);
+                        if (eskfUpdate(eskf, fM, mag[magIdx].meas, 3.0)) hasUpdate = true;
+                        magIdx++;
+                    }
+
+                    // Declination pseudo-measurement (once per keyframe if mag updates were applied)
+                    if (hasUpdate && magModel.earthFieldNedGauss) {
+                        const me = eskf.mEarth;
+                        if (me) {
+                            const decl = Math.atan2(magModel.earthFieldNedGauss.e, magModel.earthFieldNedGauss.n);
+                            const fD = createDeclinationFactor(decl, declSigma);
+                            eskfUpdate(eskf, fD, decl);
+                        }
+                    }
                 }
 
                 // Use accumulated F from this keyframe interval
