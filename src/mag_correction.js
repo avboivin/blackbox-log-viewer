@@ -1,16 +1,14 @@
 /**
  * Per-sample magnetometer correction using a characterization model.
- * Applies ellipsoid correction + alignment rotation + leveling → corrected heading.
  *
- * Pipeline (from implementation-characterization-output-button-v3.md Appendix §6):
- *   1. m_c = W_inv × (m_raw − b)           — ellipsoid correction → unit sphere
- *   2. m_b = R_s_b × m_c                    — sensor→body alignment
- *   3. m_leveled = undoRollPitch(m_b, r, p) — level to horizontal
- *   4. h_mag = atan2(−m_leveled[1], m_leveled[0]) — NED heading
- *   5. weight = cos(I) × sin(Dip_Body)     — analytic GDOP fusion weight
- *
- * @module mag_correction
+ * Pipeline:
+ *   1. m_c = W_inv × (m_raw − center)      — ellipsoid correction to unit sphere
+ *   2. m_b = alignment × m_c                — sensor-to-body rotation
+ *   3. m_leveled = undoRollPitch(m_b, r, p) — level to horizontal plane
+ *   4. h_mag = atan2(−m_leveled[1], m_leveled[0]) — magnetic heading
+ *   5. weight = cos(inclination) × sin(dip) — heading quality weight
  */
+
 
 import { mat3mulVec, undoRollPitch } from "./mag_alignment.js";
 
@@ -30,8 +28,11 @@ function applyEllipsoidCorrection(raw, { center, W_inv }) {
 }
 
 /**
- * Compute the analytic GDOP-based heading weight for post-flight fusion.
- * weight = cos(inclination) × sin(Dip_Body)
+ * Compute the heading quality weight based on local field geometry.
+ * weight = cos(inclination) × sin(dip)
+ *
+ * The weight reflects how well the horizontal field component can be resolved
+ * at this location — higher inclination means a weaker horizontal component.
  *
  * @param {MagModel} model - Characterization model with geoReference
  * @param {number[3]} m_body - Body-frame mag after alignment correction
@@ -45,10 +46,8 @@ function computeHeadingWeight(model, m_body) {
     const magNorm = Math.hypot(m_body[0], m_body[1], m_body[2]);
     if (magNorm < 1e-6) return 0;
 
-    // Body-frame expected field direction (from unit sphere reference)
-    const B_body_unit = B_unit_ned; // For now, assume body ≈ NED (identity attitude)
+    const B_body_unit = B_unit_ned;
 
-    // Dip_Body = angle between body Z and B_body
     const dipBody = Math.acos(Math.abs(B_body_unit[2]));
     const sinDip = Math.sin(dipBody);
 

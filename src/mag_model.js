@@ -1,23 +1,138 @@
 /**
  * Magnetometer characterization model loader.
- * Parses the v2 JSON schema produced by the Betaflight Configurator mag characterization wizard.
  *
- * Schema: https://betaflight.com/blackbox/mag-characterization-model/2.0
+ * Loads and validates models from the Betaflight Configurator mag characterization
+ * wizard. Supports schema versions 2.0, 2.1, and 2.2.
  *
- * @module mag_model
+ * Schema 2.2 adds a `downstream_fusion` block containing quantities needed for
+ * 3-axis magnetometer fusion: the earth field vector in Gauss, the ADC-to-Gauss
+ * scale factor, a noise model derived from the fit residuals, and quality bounds.
+ * When loading an older (2.0/2.1) model these are computed from the existing fields.
  */
 
-import { eulerToMatrix, mat3transpose, mat3mulVec, undoRollPitch, ALIGNMENT_MATRICES } from "./mag_alignment.js";
+import { eulerToMatrix, ALIGNMENT_MATRICES } from "./mag_alignment.js";
+
+const SUPPORTED_VERSIONS = ["2.0", "2.1", "2.2"];
+
+/**
+ * Sanity bounds on soft-iron and field strength to catch degenerate fits.
+ *
+ * Numeric thresholds for field-strength range (150-950 milliGauss) and per-axis
+ * soft-iron scale (max/min diagonal ratio < 2.24) originate from ArduPilot's
+ * CompassCalibrator. This is an independent JavaScript reimplementation.
+ *
+ * @param {number[3][3]|null} softIron - the W_inv soft-iron matrix
+ * @param {number|null} fieldNt - local field strength in nanotesla
+ * @returns {object}
+ */
+export function computeMagQualityBounds(softIron, fieldNt) {
+    const fieldMg = fieldNt != null ? fieldNt / 100 : null;
+    const fieldOk = fieldMg != null ? fieldMg >= 150 && fieldMg <= 950 : null;
+
+    let offdiagRatio = null;
+    let anisotropy = null;
+    if (Array.isArray(softIron) && softIron.length === 3) {
+        const diag = [
+            Math.abs(softIron[0][0]),
+            Math.abs(softIron[1][1]),
+            Math.abs(softIron[2][2]),
+        ];
+        const offdiag = [
+            Math.abs(softIron[0][1]),
+            Math.abs(softIron[0][2]),
+            Math.abs(softIron[1][2]),
+            Math.abs(softIron[1][0]),
+            Math.abs(softIron[2][0]),
+            Math.abs(softIron[2][1]),
+        ];
+        const meanDiag = (diag[0] + diag[1] + diag[2]) / 3;
+        const maxDiag = Math.max(...diag);
+        const minDiag = Math.min(...diag);
+        offdiagRatio = meanDiag > 1e-12 ? Math.max(...offdiag) / meanDiag : null;
+        anisotropy = minDiag > 1e-12 ? maxDiag / minDiag : null;
+    }
+    const offdiagOk = offdiagRatio != null ? offdiagRatio < 1.0 : null;
+    const anisotropyOk = anisotropy != null ? anisotropy < 2.24 : null;
+    const boundsOk = [fieldOk, offdiagOk, anisotropyOk].every((b) => b === true);
+
+    return {
+        field_strength_mg: fieldMg,
+        field_strength_ok: fieldOk,
+        soft_iron_offdiag_ratio: offdiagRatio,
+        soft_iron_offdiag_ok: offdiagOk,
+        soft_iron_anisotropy: anisotropy,
+        soft_iron_anisotropy_ok: anisotropyOk,
+        bounds_ok: boundsOk,
+    };
+}
+
+/**
+ * Build the fusion block for 3-axis magnetometer estimation.
+ *
+ * When the JSON includes a `downstream_fusion` block (schema 2.2) it is used
+ * directly. For older models (2.0/2.1) all values are computed from the existing
+ * ellipsoid, geo-reference, and quality fields.
+ *
+ * @param {object|null} ellipsoid - { center, soft_iron (W_inv), radius, residual_rms }
+ * @param {object|null} geoRef - { declination_deg, inclination_deg, field_strength_nt }
+ * @param {object|null} quality - { residual_xy_rms, residual_z_rms } (or null)
+ * @param {object|null} existingFusion - existing downstream_fusion block from JSON (may be null)
+ * @returns {object}
+ */
+function buildFusionBlock(ellipsoid, geoRef, quality, existingFusion) {
+    if (existingFusion) return existingFusion;
+
+    const fieldNt = geoRef?.field_strength_nt ?? null;
+    const radius = ellipsoid?.radius ?? null;
+    const softIron = ellipsoid?.soft_iron ?? null;
+    const epResidual = ellipsoid?.residual_rms ?? null;
+
+    let ntPerUnit = null;
+    let gaussPerUnit = null;
+    if (fieldNt != null && radius != null && Math.abs(radius) > 1e-9) {
+        ntPerUnit = fieldNt / radius;
+        gaussPerUnit = ntPerUnit / 1e5;
+    }
+
+    let earthFieldNedGauss = null;
+    if (fieldNt != null && geoRef?.inclination_deg != null && geoRef?.declination_deg != null) {
+        const incl = (geoRef.inclination_deg * Math.PI) / 180;
+        const decl = (geoRef.declination_deg * Math.PI) / 180;
+        const bTotalG = fieldNt / 1e5;
+        const bH = bTotalG * Math.cos(incl);
+        earthFieldNedGauss = {
+            n: bH * Math.cos(decl),
+            e: bH * Math.sin(decl),
+            d: bTotalG * Math.sin(incl),
+        };
+    }
+
+    const scaleNoise = (r) =>
+        r != null && gaussPerUnit != null ? Math.abs(r) * gaussPerUnit : null;
+
+    return {
+        frame: "FRD",
+        nt_per_corrected_unit: ntPerUnit,
+        gauss_per_corrected_unit: gaussPerUnit,
+        earth_field_ned_gauss: earthFieldNedGauss,
+        mag_noise_gauss: {
+            sigma: scaleNoise(epResidual),
+            sigma_xy: scaleNoise(quality?.residual_xy_rms),
+            sigma_z: scaleNoise(quality?.residual_z_rms),
+        },
+        quality_bounds: computeMagQualityBounds(softIron, fieldNt),
+    };
+}
 
 /**
  * Load and validate a characterization model from parsed JSON.
  *
- * @param {object} json - Parsed characterization_model JSON (v2 schema)
+ * @param {object} json - Parsed characterization model JSON
  * @returns {{ valid: boolean, error?: string, model?: MagModel }}
  */
 export function loadMagCharacterizationModel(json) {
-    if (!json || json.version !== "2.0") {
-        return { valid: false, error: "Invalid model version. Expected v2.0." };
+    if (!json || !SUPPORTED_VERSIONS.includes(json.version)) {
+        return { valid: false, error: `Unsupported model version. Expected one of: ${SUPPORTED_VERSIONS.join(", ")}.` };
     }
 
     const ec = json.ellipsoid_correction;
@@ -34,7 +149,6 @@ export function loadMagCharacterizationModel(json) {
         return { valid: false, error: "Model missing geo_reference with field strength." };
     }
 
-    // Build alignment matrix from model
     let alignmentMatrix;
     if (align.preset === 9 && align.euler_zyx_deg) {
         const e = align.euler_zyx_deg;
@@ -42,10 +156,9 @@ export function loadMagCharacterizationModel(json) {
     } else if (align.preset >= 1 && align.preset <= 8 && ALIGNMENT_MATRICES[align.preset]) {
         alignmentMatrix = ALIGNMENT_MATRICES[align.preset];
     } else {
-        alignmentMatrix = ALIGNMENT_MATRICES[1]; // CW0 identity fallback
+        alignmentMatrix = ALIGNMENT_MATRICES[1];
     }
 
-    // Build world magnetic field unit vector from geo reference (NED frame)
     const DECL = Math.PI / 180;
     const incRad = geo.inclination_deg * DECL;
     const decRad = geo.declination_deg * DECL;
@@ -62,8 +175,10 @@ export function loadMagCharacterizationModel(json) {
         B_world_ned[2] / B_total,
     ];
 
+    const fusionBlock = buildFusionBlock(ec, geo, json.quality, json.downstream_fusion);
+
     const model = {
-        version: "2.0",
+        version: json.version,
         ellipsoid: {
             center: { x: ec.center.x, y: ec.center.y, z: ec.center.z },
             W_inv: ec.soft_iron,
@@ -97,6 +212,13 @@ export function loadMagCharacterizationModel(json) {
                 qualityWeight: p.heading_quality_weight,
             }))
             : [],
+        fusion: {
+            frame: fusionBlock.frame,
+            gaussPerCorrectedUnit: fusionBlock.gauss_per_corrected_unit,
+            earthFieldNedGauss: fusionBlock.earth_field_ned_gauss,
+            magNoiseGauss: fusionBlock.mag_noise_gauss,
+            qualityBounds: fusionBlock.quality_bounds,
+        },
     };
 
     return { valid: true, model };
@@ -110,4 +232,5 @@ export function loadMagCharacterizationModel(json) {
  * @property {{ declination: number, inclination: number, fieldStrength: number, B_unit_ned: number[3] }} geoReference
  * @property {{ score: number, residualZ: number, residualXY: number, fieldConsistency: number, chirality: boolean }|null} quality
  * @property {Array<{ orientation: string, direction: string, qualityWeight: number }>} poses
+ * @property {{ frame: string, gaussPerCorrectedUnit: number|null, earthFieldNedGauss: {n:number,e:number,d:number}|null, magNoiseGauss: {sigma:number|null,sigma_xy:number|null,sigma_z:number|null}, qualityBounds: object }} fusion
  */
