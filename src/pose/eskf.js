@@ -99,37 +99,41 @@ function matInvertSym(A) {
 
 const IDX_ME = 9, IDX_MB = 12;
 
-function buildTransition(dim, q, sfAccel, omega, dt) {
+// Global (world-frame) error-state transition for the [δp, δv, δθ] block.
+// Attitude error is defined GLOBALLY:  q_true = δq(δθ_world) ⊗ q̂  (see 06 §1).
+// In this convention the deterministic attitude-error propagation is the
+// identity (F_θθ = I — no skew(ω) term; gyro error enters only via Q), and the
+// position/velocity couple to attitude through the WORLD specific force R·f:
+//   F_pθ = −skew(R·f)·½dt²,  F_vθ = −skew(R·f)·dt.
+// (The local/body form −R·skew(f) and the I−skew(ω)dt attitude block are WRONG
+//  here — they silently corrupt any non-level, rotating segment. FD-verified.)
+function buildTransition(dim, q, sfAccel, dt) {
     const F = matIdentity(dim);
     const R = quatToRot(q);
-    const [ax, ay, az] = sfAccel;
-    const [wx, wy, wz] = omega;
+    const [sx, sy, sz] = sfAccel;
     const dt2h = 0.5 * dt * dt;
 
-    const s00 = 0, s01 = -az, s02 = ay;
-    const s10 = az, s11 = 0, s12 = -ax;
-    const s20 = -ay, s21 = ax, s22 = 0;
+    // World-frame specific force  fw = R · f_body
+    const fwx = R[0][0]*sx + R[0][1]*sy + R[0][2]*sz;
+    const fwy = R[1][0]*sx + R[1][1]*sy + R[1][2]*sz;
+    const fwz = R[2][0]*sx + R[2][1]*sy + R[2][2]*sz;
 
-    const rs00 = R[0][0]*s00+R[0][1]*s10+R[0][2]*s20;
-    const rs01 = R[0][0]*s01+R[0][1]*s11+R[0][2]*s21;
-    const rs02 = R[0][0]*s02+R[0][1]*s12+R[0][2]*s22;
-    const rs10 = R[1][0]*s00+R[1][1]*s10+R[1][2]*s20;
-    const rs11 = R[1][0]*s01+R[1][1]*s11+R[1][2]*s21;
-    const rs12 = R[1][0]*s02+R[1][1]*s12+R[1][2]*s22;
-    const rs20 = R[2][0]*s00+R[2][1]*s10+R[2][2]*s20;
-    const rs21 = R[2][0]*s01+R[2][1]*s11+R[2][2]*s21;
-    const rs22 = R[2][0]*s02+R[2][1]*s12+R[2][2]*s22;
+    // skew(fw)
+    const sr00 = 0,    sr01 = -fwz, sr02 = fwy;
+    const sr10 = fwz,  sr11 = 0,    sr12 = -fwx;
+    const sr20 = -fwy, sr21 = fwx,  sr22 = 0;
 
+    // δp ← δv
     F[0][3]=dt; F[1][4]=dt; F[2][5]=dt;
-    F[0][6]=-rs00*dt2h; F[0][7]=-rs01*dt2h; F[0][8]=-rs02*dt2h;
-    F[1][6]=-rs10*dt2h; F[1][7]=-rs11*dt2h; F[1][8]=-rs12*dt2h;
-    F[2][6]=-rs20*dt2h; F[2][7]=-rs21*dt2h; F[2][8]=-rs22*dt2h;
-    F[3][6]=-rs00*dt; F[3][7]=-rs01*dt; F[3][8]=-rs02*dt;
-    F[4][6]=-rs10*dt; F[4][7]=-rs11*dt; F[4][8]=-rs12*dt;
-    F[5][6]=-rs20*dt; F[5][7]=-rs21*dt; F[5][8]=-rs22*dt;
-    F[6][6]=1; F[6][7]=wz*dt; F[6][8]=-wy*dt;
-    F[7][6]=-wz*dt; F[7][7]=1; F[7][8]=wx*dt;
-    F[8][6]=wy*dt; F[8][7]=-wx*dt; F[8][8]=1;
+    // δp ← δθ  = −skew(fw)·½dt²
+    F[0][6]=-sr00*dt2h; F[0][7]=-sr01*dt2h; F[0][8]=-sr02*dt2h;
+    F[1][6]=-sr10*dt2h; F[1][7]=-sr11*dt2h; F[1][8]=-sr12*dt2h;
+    F[2][6]=-sr20*dt2h; F[2][7]=-sr21*dt2h; F[2][8]=-sr22*dt2h;
+    // δv ← δθ  = −skew(fw)·dt
+    F[3][6]=-sr00*dt; F[3][7]=-sr01*dt; F[3][8]=-sr02*dt;
+    F[4][6]=-sr10*dt; F[4][7]=-sr11*dt; F[4][8]=-sr12*dt;
+    F[5][6]=-sr20*dt; F[5][7]=-sr21*dt; F[5][8]=-sr22*dt;
+    // δθ ← δθ  = I  (already set by matIdentity; gyro error enters via Q)
 
     return F;
 }
@@ -215,13 +219,15 @@ export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 
 }
 
 /**
- * Predict step.
+ * Predict step. Returns the transition matrix F used (for RTS smoother).
+ *
+ * @returns {{ F: number[][] }} the error-state transition matrix (dim×dim)
  */
 export function eskfPredict(eskf, omega, accel, dt) {
     const { dim } = eskf;
 
     const sfX = -accel[0], sfY = -accel[1], sfZ = -accel[2];
-    const F = buildTransition(dim, eskf.q, [sfX, sfY, sfZ], omega, dt);
+    const F = buildTransition(dim, eskf.q, [sfX, sfY, sfZ], dt);
     const Q = buildProcessNoise(dim, eskf.sigmaAcc, eskf.sigmaGyro, dt);
 
     const next = strapdownPropagate(omega, accel, eskf.q, eskf.v, eskf.p, dt);
@@ -241,6 +247,8 @@ export function eskfPredict(eskf, omega, accel, dt) {
     const FPFt = matMul(FP, matTranspose(F));
     eskf.P = matAdd(FPFt, Q);
     symmetryForce(eskf.P);
+
+    return { F };
 }
 
 /**

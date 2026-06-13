@@ -87,14 +87,22 @@ export function estimatePoses(data, origin, opts = {}) {
 
         let imuIdx = 0;
         let nextKfUs = imu[0].tUs + outputIntervalUs;
+        let F_acc = buildIdentityF(eskf.dim);
 
         while (imuIdx < imu.length) {
             const nowUs = imu[imuIdx].tUs;
 
             // Predict one IMU step
             const dtUs = imuIdx < imu.length - 1 ? imu[imuIdx + 1].tUs - imu[imuIdx].tUs : 0;
+            let F_step = null;
             if (dtUs > 0) {
-                eskfPredict(eskf, imu[imuIdx].gyro, imu[imuIdx].accel, dtUs / 1e6);
+                const result = eskfPredict(eskf, imu[imuIdx].gyro, imu[imuIdx].accel, dtUs / 1e6);
+                F_step = result.F;
+            }
+
+            // Accumulate per-step F: F_acc ← F_step · F_acc
+            if (F_step) {
+                F_acc = matMulFn(F_step, F_acc);
             }
 
             // ---- Updates at keyframe boundary ----
@@ -135,16 +143,20 @@ export function estimatePoses(data, origin, opts = {}) {
                     quatIdx++;
                 }
 
-                const F = buildF(eskf, dtUs / 1e6);
+                // Use accumulated F from this keyframe interval
+                const F_for_rts = F_acc.map((r) => [...r]);
 
                 steps.push({
                     x: { p: [...eskf.p], v: [...eskf.v], q: [...eskf.q], tUs: nowUs },
                     P: eskf.P.map((r) => [...r]),
                     xPred: { p: [...xPred.p], v: [...xPred.v], q: [...xPred.q], tUs: xPred.tUs },
                     PPred,
-                    F,
+                    F: F_for_rts,
                     hasUpdate,
                 });
+
+                // Reset accumulated F for next interval
+                F_acc = buildIdentityF(eskf.dim);
 
                 nextKfUs += outputIntervalUs;
             }
@@ -193,17 +205,27 @@ export function estimatePoses(data, origin, opts = {}) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function buildF(eskf, dt) {
-    const F = new Array(9);
-    for (let i = 0; i < 9; i++) {
-        F[i] = new Array(9).fill(0);
+function buildIdentityF(n) {
+    const F = new Array(n);
+    for (let i = 0; i < n; i++) {
+        F[i] = new Array(n).fill(0);
         F[i][i] = 1;
     }
-    // δp ← δv coupling
-    F[0][3] = dt;
-    F[1][4] = dt;
-    F[2][5] = dt;
     return F;
+}
+
+function matMulFn(A, B) {
+    const n = A.length;
+    const C = new Array(n);
+    for (let i = 0; i < n; i++) {
+        C[i] = new Array(n).fill(0);
+        for (let k = 0; k < n; k++) {
+            const aik = A[i][k];
+            if (aik === 0) continue;
+            for (let j = 0; j < n; j++) C[i][j] += aik * B[k][j];
+        }
+    }
+    return C;
 }
 
 function findBaroAtTime(baro, tUs) {

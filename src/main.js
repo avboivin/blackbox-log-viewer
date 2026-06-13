@@ -669,10 +669,10 @@ function BlackboxLogViewer() {
             appStore.magCharacterizationModel = result.model;
             console.log("Mag characterization model loaded:", result.model.ellipsoid);
           } else {
-            alert("Invalid mag model: " + (result.error || "unknown error"));
+            alert(`Invalid mag model: ${  result.error || "unknown error"}`);
           }
         } catch (err) {
-          alert("Failed to parse mag model JSON: " + err.message);
+          alert(`Failed to parse mag model JSON: ${  err.message}`);
         }
       };
       reader.readAsText(file);

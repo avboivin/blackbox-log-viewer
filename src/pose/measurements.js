@@ -42,7 +42,10 @@ function quatConjugate(q) {
 }
 
 function quatToRotMat(q) {
-  // q = [w, x, y, z] scalar-first
+  // Canonical body(FRD)→world(NED) rotation R, 3×3 row-major flat.
+  // v_world = R · v_body.  Matches imuMechanization.quatToRot exactly.
+  // (Previously this returned Rᵀ — the world→body transpose — which silently
+  //  conflicted with the strapdown/injection convention. FD/loop-verified.)
   const [w, x, y, z] = q;
   const xx = x * x, yy = y * y, zz = z * z;
   const xy = x * y, xz = x * z, yz = y * z;
@@ -50,18 +53,18 @@ function quatToRotMat(q) {
 
   const m = new Array(9);
   m[0] = 1 - 2 * (yy + zz);
-  m[1] = 2 * (xy + wz);
-  m[2] = 2 * (xz - wy);
+  m[1] = 2 * (xy - wz);
+  m[2] = 2 * (xz + wy);
 
-  m[3] = 2 * (xy - wz);
+  m[3] = 2 * (xy + wz);
   m[4] = 1 - 2 * (xx + zz);
-  m[5] = 2 * (yz + wx);
+  m[5] = 2 * (yz - wx);
 
-  m[6] = 2 * (xz + wy);
-  m[7] = 2 * (yz - wx);
+  m[6] = 2 * (xz - wy);
+  m[7] = 2 * (yz + wx);
   m[8] = 1 - 2 * (xx + yy);
 
-  return m;  // 3×3 row-major
+  return m;  // 3×3 row-major, body→world
 }
 
 function logMap(R) {
@@ -217,12 +220,15 @@ export function createQuaternionPrior(qMeas, sigma = 0.1) {
   ];
 
   function residual(z, x) {
-    // r = 2 * logMap( R_meas * R_state^T )
-    // qMeas_conj * q_state  gives the relative rotation quaternion
-    const qRel = quatMultiply(quatConjugate(qMeas), x.q);
+    // GLOBAL (world-frame) attitude residual:  r = logMap( R_meas · R_state^T ).
+    // With q_true = δq(δθ_world) ⊗ q̂, ∂r/∂δθ_world = −I, so H = [0,0,I] is exact.
+    // qMeas ⊗ q_state*  gives R_meas · R_state^T.
+    // (The previous 2·logMap(R_meas^T·R_state) was the BODY-frame error with a
+    //  spurious factor of 2 — inconsistent with the global injection. FD-verified.)
+    const qRel = quatMultiply(qMeas, quatConjugate(x.q));
     const Rrel = quatToRotMat(qRel);
     const omega = logMap(Rrel);
-    return [2 * omega[0], 2 * omega[1], 2 * omega[2]];
+    return [omega[0], omega[1], omega[2]];
   }
 
   return { h, H, R, residual };
@@ -243,24 +249,15 @@ export function createMagFactor(meas, sigma = 0.05) {
     const varM = sigma * sigma;
     const Rnoise = [[varM, 0, 0], [0, varM, 0], [0, 0, varM]];
 
-    // Internal quaternion to rotation helpers (local copy to avoid import)
-    function q2r(q) {
-        const [w,x,y,z] = q;
-        const xx=x*x, yy=y*y, zz=z*z, xy=x*y, xz=x*z, yz=y*z, wx=w*x, wy=w*y, wz=w*z;
-        return [
-            1-2*(yy+zz), 2*(xy+wz), 2*(xz-wy),
-            2*(xy-wz), 1-2*(xx+zz), 2*(yz+wx),
-            2*(xz+wy), 2*(yz-wx), 1-2*(xx+yy),
-        ];
-    }
-
     let cachedH = null;
 
+    // m = quatToRotMat(q) is canonical body→world R (flat row-major, R[i][j]=m[3i+j]).
+    // The physical model is the earth field rotated world→body:  h = Rᵀ·m_earth + m_body.
+    // Rᵀ row i = column i of R = [m[i], m[3+i], m[6+i]].
     function h(x) {
-        const m = q2r(x.q);
-        const me = x.mEarth || [0,0,0];
-        const mb = x.mBody || [0,0,0];
-        // R^T = transposed rotation; but m is row-major body→world, so R^T is column access
+        const m = quatToRotMat(x.q);
+        const me = x.mEarth || [0, 0, 0];
+        const mb = x.mBody || [0, 0, 0];
         return [
             m[0]*me[0] + m[3]*me[1] + m[6]*me[2] + mb[0],
             m[1]*me[0] + m[4]*me[1] + m[7]*me[2] + mb[1],
@@ -269,18 +266,27 @@ export function createMagFactor(meas, sigma = 0.05) {
     }
 
     function residual(z, x) {
-        const m = q2r(x.q);
-        const me = x.mEarth || [0,0,0];
-        // mEarth in body frame = R^T * mEarth
-        const meBx = m[0]*me[0] + m[3]*me[1] + m[6]*me[2];
-        const meBy = m[1]*me[0] + m[4]*me[1] + m[7]*me[2];
-        const meBz = m[2]*me[0] + m[5]*me[1] + m[8]*me[2];
+        const m = quatToRotMat(x.q);
+        const me = x.mEarth || [0, 0, 0];
+        const me0 = me[0], me1 = me[1], me2 = me[2];
 
-        // ∂h/∂θ = skew(mEarth_body)
+        // ∂h/∂δθ in the GLOBAL (world-frame) error convention (q_true = δq(δθ_world) ⊗ q̂):
+        //   ∂(Rᵀ·m_earth)/∂δθ_world = Rᵀ·skew(m_earth).   FD- and loop-verified.
+        // ∂h/∂m_earth = Rᵀ  (cols 9-11);  ∂h/∂m_body = I  (cols 12-14).
+        // Rᵀ row i = [m[i], m[3+i], m[6+i]].
+        const rowSkew = (r0, r1, r2) => [
+            r1*me2 - r2*me1,
+            -r0*me2 + r2*me0,
+            r0*me1 - r1*me0,
+        ];
+        const t0 = rowSkew(m[0], m[3], m[6]);
+        const t1 = rowSkew(m[1], m[4], m[7]);
+        const t2 = rowSkew(m[2], m[5], m[8]);
+
         cachedH = [
-            [0,0,0, 0,0,0, 0,-meBz,meBy, m[0],m[3],m[6], 1,0,0],
-            [0,0,0, 0,0,0, meBz,0,-meBx, m[1],m[4],m[7], 0,1,0],
-            [0,0,0, 0,0,0, -meBy,meBx,0, m[2],m[5],m[8], 0,0,1],
+            [0,0,0, 0,0,0, t0[0],t0[1],t0[2], m[0],m[3],m[6], 1,0,0],
+            [0,0,0, 0,0,0, t1[0],t1[1],t1[2], m[1],m[4],m[7], 0,1,0],
+            [0,0,0, 0,0,0, t2[0],t2[1],t2[2], m[2],m[5],m[8], 0,0,1],
         ];
         const hp = h(x);
         return [z[0]-hp[0], z[1]-hp[1], z[2]-hp[2]];
