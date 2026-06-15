@@ -16,7 +16,7 @@ import { describe, it, beforeAll, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { ingestFlightLog, loadFlightLogFromBuffer } from "./flightIngestion.js";
+import { ingestFlightLog, loadFlightLogFromBuffer, correctMagStream } from "./flightIngestion.js";
 import { estimatePoseTrack } from "./estimatorLoop.js";
 import { loadMagCharacterizationModel } from "../mag_model.js";
 import { llhToNed } from "./geodesy.js";
@@ -61,7 +61,18 @@ for (const fx of FIXTURES) {
             modelBoundsOk = !!mr.model && mr.model.fusion?.qualityBounds?.bounds_ok !== false;
 
             const origin = d.gpsHome || { lat: d.gps[0].lat, lon: d.gps[0].lon, alt: d.gps[0].alt };
-            const track = estimatePoseTrack({ ...d, mag: [] }, origin, { outputHz: 20 });
+
+            // Correct mag through the characterization model for 3-axis ESKF fusion (WS-B6)
+            const magGauss = mr.model ? correctMagStream(d.mag, mr.model) : [];
+
+            const track = estimatePoseTrack(
+                { ...d, mag: magGauss },
+                origin,
+                {
+                    outputHz: 20,
+                    magModel: mr.model?.fusion || null,
+                },
+            );
 
             ctx = {
                 samples: track.samples,

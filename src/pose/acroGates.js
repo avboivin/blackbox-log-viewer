@@ -178,18 +178,19 @@ export function gatePitchFlip(ctx, seg) {
 }
 
 /** climb_fall: large altitude excursion consistent with baro, a dramatic orientation
- *  change at the top, and freefall in the fall sub-window.
+ *  change at the top, freefall in the fall sub-window, and nose-down during the fall.
  *
- *  NOTE — we deliberately do NOT assert "nose-down" here. On acro1 the pilot reports
- *  "looking at the ground" during the fall, but BOTH the FC's onboard attitude AND our
- *  reconstruction (which faithfully tracks it) show nose-UP/inverted through this window.
- *  In freefall the accelerometer reads ~0 g, so there is no gravity reference and pitch is
- *  pure gyro integration → it drifts. This is a SHARED-MODE error of the FC and our
- *  estimator that only the human play-by-play caught (planv5/18 §31). Asserting nose-down
- *  would assert something the data cannot support; instead we assert the verifiable facts
- *  (climb height vs baro, freefall, that the attitude changed dramatically). */
+ *  The nose-down assertion (WS-B7) was previously held back because both the FC's
+ *  onboard attitude and the gyro-only reconstruction read nose-UP during freefall
+ *  while the pilot was actually looking down. In freefall the accelerometer reads
+ *  ~0 g → no gravity reference → pitch is pure gyro integration, which drifts.
+ *  With 3-axis mag fusion (WS-B6), m_earth provides an independent attitude
+ *  reference that should recover the true nose-down pitch. This gate now asserts
+ *  it and fails loudly if mag fusion hasn't corrected the freefall attitude.
+ *
+ *  Fall sub-window: the last 4 s of the segment (or seg.params.fallWindow if set). */
 export function gateClimbFall(ctx, seg) {
-    const { minClimbM = 25, baroTolM = 20, minTiltDeg = 60, maxFreefallAccel = 3 } = seg.params || {};
+    const { minClimbM = 25, baroTolM = 20, minTiltDeg = 60, maxFreefallAccel = 3, noseDownMaxPitchDeg = -20 } = seg.params || {};
     const ws = windowSamples(ctx.samples, seg.t0, seg.t1, ctx.offsetSec);
     if (!ws.length) return mk(seg.name, false, "no samples in window");
     let dMin = Infinity, dMax = -Infinity, maxTilt = 0;
@@ -200,11 +201,29 @@ export function gateClimbFall(ctx, seg) {
     for (const bb of ctx.baro) { if (bb.tUs < a || bb.tUs > b) continue; if (bb.alt < bMin) bMin = bb.alt; if (bb.alt > bMax) bMax = bb.alt; }
     const baroClimb = (bMax - bMin);
     const ff = seg.expect.fall ? minAccelInWindow(ctx.imu, seg.expect.fall[0], seg.expect.fall[1], ctx.offsetSec) : 0;
+
+    // Nose-down in fall: sample pitch during the fall sub-window (WS-B7)
+    let noseDownPass = true;
+    let noseDownDetail = "n/a";
+    if (seg.expect && seg.expect.fall) {
+        const fallSamples = windowSamples(ctx.samples, seg.expect.fall[0], seg.expect.fall[1], ctx.offsetSec);
+        if (fallSamples.length > 0) {
+            const pitches = fallSamples.map((s) => pitchDeg(s.q));
+            pitches.sort((a, b) => a - b);
+            const medPitch = pitches[pitches.length >> 1];
+            noseDownPass = medPitch < noseDownMaxPitchDeg;
+            noseDownDetail = `median pitch ${medPitch.toFixed(0)}° (need < ${noseDownMaxPitchDeg}° = nose-down)`;
+        } else {
+            noseDownDetail = "no fall samples";
+        }
+    }
+
     const pass = reconClimb > minClimbM
         && Math.abs(reconClimb - baroClimb) < baroTolM
         && maxTilt > minTiltDeg
-        && (!seg.expect.fall || ff < maxFreefallAccel);
-    return mk(seg.name, pass, `reconClimb ${reconClimb.toFixed(0)} m vs baro ${baroClimb.toFixed(0)} m (Δ<${baroTolM}), maxTilt ${maxTilt.toFixed(0)}° (>${minTiltDeg} orientation change), freefall ${ff.toFixed(1)} (<${maxFreefallAccel})`);
+        && (!seg.expect.fall || ff < maxFreefallAccel)
+        && noseDownPass;
+    return mk(seg.name, pass, `reconClimb ${reconClimb.toFixed(0)} m vs baro ${baroClimb.toFixed(0)} m (Δ<${baroTolM}), maxTilt ${maxTilt.toFixed(0)}° (>${minTiltDeg} orientation change), freefall ${ff.toFixed(1)} (<${maxFreefallAccel}), ${noseDownDetail}`);
 }
 
 /** backward: nose ~opposite to travel somewhere in the window (heading ≠ GPS course). */

@@ -62,23 +62,16 @@ function _runEstimation(data, origin, opts = {}) {
         useTau = false,
         useDcs = false,
         current = null,
-        procSigmaAcc = 8.0,
-        procSigmaGyro = 0.08,
-        // GPS innovation gates (σ-multiples). Deliberately GENEROUS (15σ), not the
-        // textbook 3–5σ. This filter has NO accel/gyro bias states (18 §28 known
-        // future work), so during aggressive flight the IMU-propagated position/
-        // velocity prediction legitimately diverges from GPS by many σ before the
-        // next fix corrects it. A tight gate (the old 5.0) then misreads these real
-        // innovations as outliers, rejects GPS, and the filter dead-reckons into
-        // hundreds of metres of drift — the same gating runaway as 18 §28, which was
-        // previously MASKED by the broken-gyro frozen attitude (a tight gate "worked"
-        // only because the dead attitude produced tame predictions). With the gyro
-        // fixed (18 §29), 15σ admits real maneuvers (real-flight: loop 5.7 m, drift 4.3 m)
-        // while still rejecting gross >15σ GPS glitches. DCS robust scaling is the
-        // wrong tool here: at φ=1 it shrinks the legitimately-large innovations too
-        // (real-flight: 300–425 m drift). Root fix is bias states, not a tighter gate.
-        gpsPosGate = 15.0,
-        gpsVelGate = 15.0,
+        procSigmaAcc = 0.35,   // AP EKF3 default: accelerometer process noise 1σ (m/s²)
+        procSigmaGyro = 0.015,  // AP EKF3 default: gyroscope process noise 1σ (rad/s)
+        // GPS innovation gates (σ-multiples). Principled 5σ per ArduPilot EKF3.
+        // The old 15σ band-aid was necessary without bias states (b_a/b_g) because
+        // uncompensated IMU bias caused legitimate IMU divergence between GPS fixes
+        // that a tight gate misread as outliers. With unconditional b_a/b_g states
+        // (Task A, planv5 Q3), bias is estimated explicitly — IMU prediction stays
+        // within a 5σ gate, and the 15σ gate becomes the loosening, not the cure.
+        gpsPosGate = 5.0,
+        gpsVelGate = 5.0,
     } = opts;
 
     const { imu, gps, baro, quat, mag } = data;

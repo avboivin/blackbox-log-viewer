@@ -240,7 +240,7 @@ function varianceFloor(P, minVal = 1e-6) {
  * @param {number} [opts.sigmaTau=0.05]
  * @param {number} [opts.sigmaKI=0.01]
  */
-export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 0.2, ba0, bg0, sigmaBa = 0.5, sigmaBg = 0.05, sigmaBaRW = 2e-4, sigmaBgRW = 3e-5, mEarth0, mBody0, sigmaMagEarth = 0.05, sigmaMagBody = 0.02, tauGps0, kI0, sigmaTau = 0.05, sigmaKI = 0.01, procSigmaAcc = 8.0, procSigmaGyro = 0.08 }) {
+export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 0.2, ba0, bg0, sigmaBa = 0.5, sigmaBg = 0.05, sigmaBaRW = 2e-4, sigmaBgRW = 3e-5, mEarth0, mBody0, sigmaMagEarth = 0.05, sigmaMagBody = 0.02, tauGps0, kI0, sigmaTau = 0.05, sigmaKI = 0.01, procSigmaAcc = 0.35, procSigmaGyro = 0.015 }) {
     const hasMag = mEarth0 != null;
     const hasTau = tauGps0 != null;
     const hasKI = kI0 != null;

@@ -11,6 +11,37 @@
 
 import { FlightLogParser } from "../flightlog_parser.js";
 import { quatToRot, eulerToQuat } from "./imuMechanization.js";
+import { correctMagToBody } from "../mag_correction.js";
+
+/**
+ * Apply the mag characterization model to a raw ADC mag stream, producing
+ * body-frame Gauss vectors for 3-axis ESKF fusion.
+ *
+ * Delegates correction math to mag_correction.js (planv5 Q2: single source of
+ * truth). Does NO correction math itself — only maps over the stream.
+ *
+ * Samples that fail ellipsoid correction (zero vector, NaN) are dropped.
+ *
+ * @param {Array<{tUs:number, meas:[3]}>} magRaw - raw ADC mag samples from ingestFlightLog
+ * @param {object} model - loaded MagModel (the .model from loadMagCharacterizationModel)
+ * @returns {Array<{tUs:number, meas:[3]}>} body-frame Gauss vectors
+ */
+export function correctMagStream(magRaw, model) {
+    const out = [];
+    for (const m of magRaw) {
+        const r = correctMagToBody(m.meas, model);
+        if (!r) continue;
+        const gpu = r.gaussPerCorrectedUnit;
+        if (gpu != null && Math.abs(gpu) > 1e-12) {
+            // Scale unit-sphere vector to physical Gauss
+            out.push({
+                tUs: m.tUs,
+                meas: [r.mBody[0] * gpu, r.mBody[1] * gpu, r.mBody[2] * gpu],
+            });
+        }
+    }
+    return out;
+}
 
 const FLIGHT_LOG_FIELD_INDEX_TIME = FlightLogParser.prototype.FLIGHT_LOG_FIELD_INDEX_TIME;
 
