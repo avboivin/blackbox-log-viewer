@@ -172,18 +172,25 @@ export function createGpsVelocityFactor(meas, sigma = 0.5) {
  *
  * The barometer reads altitude relative to the arming point.
  * baroOffset = GPS_alt_at_arm − baroAlt_at_arm converts baro-relative to MSL-absolute.
- * Measurement model: z ≈ −p_D + baroOffset.
+ * Measurement model: z ≈ −p_D.
+ *
+ * The baro reading is relative to the arm point; p_D is the NED down coordinate
+ * relative to the origin. Since origin and arm are approximately the same physical
+ * location, they match without an offset. Adding baroOffset (~GPS MSL altitude,
+ * typically >100 m) creates a constant innovation offset that saturates the 3σ gate
+ * and silently rejects all baro measurements — the D coordinate then drifts uncorrected.
+ * (planv5/18 §35 — baro-offset bug, 2026-06-15)
  *
  * @param {number} baroAlt     Raw barometer altitude (m, relative to arm point)
- * @param {number} baroOffset  Fixed offset to convert to absolute MSL (m)
+ * @param {number} baroOffset  (UNUSED — retained for API compat only)
  * @param {number} [sigma=1.0] 1σ noise in metres
  */
 export function createBaroFactor(baroAlt, baroOffset, sigma = 1.0) {
   const varZ = sigma * sigma;
 
-  // h(x) = −p_D + baroOffset
+  // h(x) = −p_D (baro reads approximately −p_D when origin ≈ arm point)
   function h(x) {
-    return -x.p[2] + baroOffset;
+    return -x.p[2];
   }
 
   // H = [[0, 0, -1,  0, 0, 0,  0, 0, 0]] — only D component of position

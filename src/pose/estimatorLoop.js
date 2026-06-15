@@ -224,11 +224,23 @@ function _runEstimation(data, origin, opts = {}) {
                     gpsIdx++;
                 }
 
-                // Baro update
-                while (baroIdx < baro.length && baro[baroIdx].tUs <= nextKfUs) {
-                    const fB = createBaroFactor(baro[baroIdx].alt, baroOffset, baroSigma);
-                    if (eskfUpdate(eskf, fB, baro[baroIdx].alt)) hasUpdate = true;
-                    baroIdx++;
+                // Baro update — only the LAST sample before this keyframe.
+                // Baro is logged at I-frame rate (500 Hz), but the value changes only at
+                // ~Hz rates. Fusing 25 near-identical corrections per keyframe drives P_D
+                // to near-zero (measurement over-counting) → the filter becomes overconfident
+                // and rejects the baro when altitude actually changes. One update per keyframe
+                // (20 Hz) is the correct bandwidth for a barometric altimeter.
+                // (planv5/18 §35 — baro over-counting, 2026-06-15)
+                {
+                    let lastBaro = null;
+                    while (baroIdx < baro.length && baro[baroIdx].tUs <= nextKfUs) {
+                        lastBaro = baro[baroIdx];
+                        baroIdx++;
+                    }
+                    if (lastBaro) {
+                        const fB = createBaroFactor(lastBaro.alt, baroOffset, baroSigma);
+                        if (eskfUpdate(eskf, fB, lastBaro.alt)) hasUpdate = true;
+                    }
                 }
 
                 // Quaternion prior — fused WITHOUT chi-square gating (gate=Infinity).
@@ -242,10 +254,24 @@ function _runEstimation(data, origin, opts = {}) {
                 // when they disagree the FC quaternion is the more trustworthy of the
                 // two. See 18 §29 (real-flight: ungating restores heading tracking to ±25°,
                 // reproduces the 180° yaw reversals; gated, yaw froze).
-                while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
-                    const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
-                    if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
-                    quatIdx++;
+                //
+                // Only the LAST quaternion sample before the keyframe is fused. Like baro,
+                // the quaternion is logged at I-frame rate (500 Hz) — applying 25 near-
+                // identical corrections without interleaving gyro steps drives the attitude
+                // covariance P_θ to near-zero (measurement over-counting). The filter then
+                // trusts its own (drifting) integration over the FC anchor, and attitude
+                // diverges. One prior per keyframe is the correct bandwidth.
+                // (planv5/18 §35 — quaternion-prior over-counting, 2026-06-15)
+                {
+                    let lastQuat = null;
+                    while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
+                        lastQuat = quat[quatIdx];
+                        quatIdx++;
+                    }
+                    if (lastQuat) {
+                        const fQ = createQuaternionPrior(lastQuat.q, attSigma);
+                        if (eskfUpdate(eskf, fQ, lastQuat.q, Infinity)) hasUpdate = true;
+                    }
                 }
 
                 // 3-axis mag update (gate 3.0 per 09 §1)
