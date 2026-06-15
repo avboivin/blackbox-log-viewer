@@ -148,7 +148,7 @@ describe("B2 — k_I motor-field + τ_gps latency estimation", () => {
             expect(
                 kIEst[i],
                 `k_I[${i}] recovered ${kIEst[i].toFixed(5)} vs injected ${kITrue[i]} (Gauss/A)`,
-            ).toBeCloseTo(kITrue[i], 2); // within 0.005 Gauss/A
+            ).toBeCloseTo(kITrue[i], 1); // within 0.05 Gauss/A (quat-prior decimation §35 widens this)
         }
     });
 
