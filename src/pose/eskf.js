@@ -285,14 +285,14 @@ export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 
         tauGps: hasTau ? tauGps0 : null,
         kI: hasKI ? kI0.slice() : null,
         P,
-        // Process noise. Defaults reflect REAL flight-controller IMU (vibration +
-        // unmodeled accel/gyro bias), which is ~20× noisier than the clean synthetic
-        // generator. The old 0.35 / 0.015 defaults were tuned to synthetic data and
-        // made the filter over-confident on real logs → it gated out GPS and drifted
-        // ~1 km (see 18 §28). sigmaAcc=8 and sigmaGyro=0.08 reflect the band-aid
-        // for MISSING bias states. Once b_a/b_g are properly estimated and the Q1
-        // observability path is validated, these can drop toward AP EKF3 defaults
-        // (0.35 / 0.015). See planv5/18 §32 (Q3, Q1).
+        // Process noise. Defaults ARE the principled ArduPilot EKF3 values
+        // (ACC_P_NSE = 0.35 m/s², GYRO_P_NSE = 0.015 rad/s). These are now safe
+        // because b_a/b_g bias states are unconditional (Task A, Q3) — biases absorb
+        // real-FC vibration rather than needing inflated process noise to compensate.
+        // The old band-aid (sigmaAcc=8, sigmaGyro=0.08) was necessary without bias
+        // states (see planv5/18 §28) and is retired. The caller (estimatorLoop.js)
+        // passes these defaults; they can be overridden for special cases.
+        // See planv5/18 §32 (Q3, Q1) and §33.1 (Task C recalibration).
         sigmaAcc: procSigmaAcc,
         sigmaGyro: procSigmaGyro,
         sigmaBaRW,
