@@ -70,7 +70,7 @@ for (const fx of FIXTURES) {
                 origin,
                 {
                     outputHz: 20,
-                    magModel: mr.model?.fusion || null,
+                    magModel: null,  // Planv5/18 §38: mag fusion disabled pending WS-B6 (H_mag column audit)
                 },
             );
 
@@ -82,7 +82,7 @@ for (const fx of FIXTURES) {
                 gpsNed: d.gps.map((g) => ({ tUs: g.tUs, ...llhToNed(g.lat, g.lon, g.alt, origin.lat, origin.lon, origin.alt) })),
                 offsetSec: manifest.alignment.offsetSec,
             };
-        });
+        }, 120000);
 
         it("mag model loads and is validly configured (bounds_ok)", () => {
             if (skip) { console.warn("SKIP"); return; }

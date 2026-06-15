@@ -462,10 +462,11 @@ export function rtsSmooth(filterResults, transitionMatrices) {
     // State update: δx = C_k · (x_{k+1|N} ⊖ x_{k+1|k})
     const deltaNext = stateDifference(xkp1Smoothed, xkp1Pred);
     const deltaX = matrixVectorMultiply(Ck, deltaNext);
+    // Zero δθ: quat-prior anchors attitude; smoother must not undo it via F-coupling (§37.1)
+    deltaX[6] = 0; deltaX[7] = 0; deltaX[8] = 0;
     smoothed[k] = {
       x: stateAdd(filterResults[k].x, deltaX),
       P: (function () {
-        // P_{k|N} = P_{k|k} + C_k · (P_{k+1|N} − P_{k+1|k}) · C_k^T
         const dP = matrixSub(Pkp1Smoothed, Pkp1Pred);
         const CdP = matrixMultiply(Ck, dP);
         const CdPCt = matrixMultiply(CdP, matrixTranspose(Ck));

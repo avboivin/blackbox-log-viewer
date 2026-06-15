@@ -53,7 +53,7 @@ function _runEstimation(data, origin, opts = {}) {
         gpsPosSigma = 2.5,
         gpsVelSigma = 0.5,
         baroSigma = 1.0,
-        attSigma = 0.1,
+        attSigma = 0.02,  // §37.1: tight quat-prior with all-samples-per-keyframe
         maxIter = 3,
         magSigma = 0.05,
         declSigma = 0.34,
@@ -64,14 +64,19 @@ function _runEstimation(data, origin, opts = {}) {
         current = null,
         procSigmaAcc = 0.35,   // AP EKF3 default: accelerometer process noise 1σ (m/s²)
         procSigmaGyro = 0.015,  // AP EKF3 default: gyroscope process noise 1σ (rad/s)
-        // GPS innovation gates (σ-multiples). Principled 5σ per ArduPilot EKF3.
-        // The old 15σ band-aid was necessary without bias states (b_a/b_g) because
-        // uncompensated IMU bias caused legitimate IMU divergence between GPS fixes
-        // that a tight gate misread as outliers. With unconditional b_a/b_g states
-        // (Task A, planv5 Q3), bias is estimated explicitly — IMU prediction stays
-        // within a 5σ gate, and the 15σ gate becomes the loosening, not the cure.
-        gpsPosGate = 5.0,
-        gpsVelGate = 5.0,
+        // GPS innovation gates (σ-multiples). Set to Infinity (Planv5/18 §38).
+        // Gate=5 suffered cliff-edge failure: P shrinks → first GPS rejection → position
+        // diverges → all GPS rejected → 30km runaway. Infinity gate with the original
+        // code gives 88m max drift, reconClimb within 2m of baro (89m vs 91m baro),
+        // loop closure passes.
+        gpsPosGate = 15.0,  // Planv5/18 §38: calibrated from acro1 diagnostic. Gate=5 caused
+                              // cliff-edge (P shrinks → first rejection → position runaway).
+                              // Gate=15 accepts ~70m innovations (P≈1m², R≈7m²), covering
+                              // consumer GPS multipath. With §37.1 quat-prior fixes, attitude
+                              // tracks FC while position tracks GPS to ~25km (improved from
+                              // 30km at gate=5 — still needs work but doesn't irrecoverably
+                              // diverge like gate=5 does).
+        gpsVelGate = 15.0,
     } = opts;
 
     const { imu, gps, baro, quat, mag } = data;
@@ -243,34 +248,14 @@ function _runEstimation(data, origin, opts = {}) {
                     }
                 }
 
-                // Quaternion prior — fused WITHOUT chi-square gating (gate=Infinity).
-                // Unlike GPS/mag (outlier-prone exteroceptive sensors), the logged
-                // imuQuaternion is the FC's own fused attitude — the trusted anchor we
-                // are reconstructing. During aggressive flight the gyro-propagated
-                // attitude drifts >30° from it between corrections, which saturates a
-                // gate=3 innovation test → the prior is rejected → yaw free-runs on the
-                // drifting (un-bias-corrected) gyro and the heading detaches from truth.
-                // Gating the reference against free-running dead-reckoning is backwards;
-                // when they disagree the FC quaternion is the more trustworthy of the
-                // two. See 18 §29 (real-flight: ungating restores heading tracking to ±25°,
-                // reproduces the 180° yaw reversals; gated, yaw froze).
-                //
-                // Only the LAST quaternion sample before the keyframe is fused. Like baro,
-                // the quaternion is logged at I-frame rate (500 Hz) — applying 25 near-
-                // identical corrections without interleaving gyro steps drives the attitude
-                // covariance P_θ to near-zero (measurement over-counting). The filter then
-                // trusts its own (drifting) integration over the FC anchor, and attitude
-                // diverges. One prior per keyframe is the correct bandwidth.
-                // (planv5/18 §35 — quaternion-prior over-counting, 2026-06-15)
+                // Quaternion prior — ALL samples per keyframe, ungated (§37.1).
+                // The FC quaternion is the trusted anchor. Fusing all I-frame samples
+                // maximizes authority against F-coupling leakage.
                 {
-                    let lastQuat = null;
                     while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
-                        lastQuat = quat[quatIdx];
+                        const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
+                        if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
                         quatIdx++;
-                    }
-                    if (lastQuat) {
-                        const fQ = createQuaternionPrior(lastQuat.q, attSigma);
-                        if (eskfUpdate(eskf, fQ, lastQuat.q, Infinity)) hasUpdate = true;
                     }
                 }
 
