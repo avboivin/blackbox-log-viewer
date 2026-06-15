@@ -1,22 +1,28 @@
 /**
  * Measurement models (factors) for a drone body-pose ESKF estimator.
  *
- * Error state δx = [δp(3), δv(3), δθ(3)]
+ * Error state δx = [δp(3), δv(3), δθ(3), b_a(3), b_g(3), m_earth(3), m_body(3), τ(1), k_I(3)]
  *   δp  = position error (NED, m)
  *   δv  = velocity error (NED, m/s)
  *   δθ  = attitude error (rotation vector in world frame, rad)
+ *   b_a = accelerometer bias (FRD, m/s²) — unconditional (Q3)
+ *   b_g = gyroscope bias (FRD, rad/s) — unconditional (Q3)
  *
- * Nominal state x = { p, v, q }
+ * Nominal state x = { p, v, q, ba, bg, mEarth?, mBody?, tauGps?, kI? }
  *   p = position in NED (m)
  *   v = velocity in NED (m/s)
  *   q = [w,x,y,z] scalar-first, body(FRD) → world(NED)
  *
  * Gravity: [0, 0, +9.80665] in NED
  *
- * Jacobian row layout: δp indices 0-2, δv indices 3-5, δθ indices 6-8.
+ * State indices (Q3: 25-state):
+ *   0-2: δp, 3-5: δv, 6-8: δθ, 9-11: b_a, 12-14: b_g,
+ *   15-17: m_earth, 18-20: m_body, 21: τ_gps, 22-24: k_I
+ *
+ * Jacobian row layout: each row is length matched to the state dimension.
  * Each factory returns an object with:
  *   h(x)         – measurement prediction
- *   H            – 1D 9-element array per measurement row (3 rows for 3D, 1 for 1D)
+ *   H            – 1D N-element array per measurement row
  *   R            – noise covariance matrix
  *   residual(z,x)– computes r = z − h(x)
  */
@@ -237,31 +243,30 @@ export function createQuaternionPrior(qMeas, sigma = 0.1) {
 /**
  * 3-axis magnetometer measurement (body frame, in Gauss).
  *
- * Measurement model: z_mag = R(q)^T · m_earth + m_body
+ * Measurement model: z_mag = R(q)^T · m_earth + m_body + k_I · I(t)
  *
- * H rows are 15-element for the 9-base + 6-mag state.
+ * H rows are dimensioned for 19-state (9 base + 6 mag + 1 τ + 3 k_I).
  *
  * @param {number[]} meas   - mag reading [bx,by,bz] body FRD (Gauss)
  * @param {number}   sigma  - measurement noise 1σ (Gauss)
+ * @param {number}   [currentAmps=0] - battery current in Amps (drives k_I term)
  * @returns {object} factor
  */
-export function createMagFactor(meas, sigma = 0.05) {
+export function createMagFactor(meas, sigma = 0.05, currentAmps = 0) {
     const varM = sigma * sigma;
     const Rnoise = [[varM, 0, 0], [0, varM, 0], [0, 0, varM]];
 
     let cachedH = null;
 
-    // m = quatToRotMat(q) is canonical body→world R (flat row-major, R[i][j]=m[3i+j]).
-    // The physical model is the earth field rotated world→body:  h = Rᵀ·m_earth + m_body.
-    // Rᵀ row i = column i of R = [m[i], m[3+i], m[6+i]].
     function h(x) {
         const m = quatToRotMat(x.q);
         const me = x.mEarth || [0, 0, 0];
         const mb = x.mBody || [0, 0, 0];
+        const kI = x.kI || [0, 0, 0];
         return [
-            m[0]*me[0] + m[3]*me[1] + m[6]*me[2] + mb[0],
-            m[1]*me[0] + m[4]*me[1] + m[7]*me[2] + mb[1],
-            m[2]*me[0] + m[5]*me[1] + m[8]*me[2] + mb[2],
+            m[0]*me[0] + m[3]*me[1] + m[6]*me[2] + mb[0] + kI[0] * currentAmps,
+            m[1]*me[0] + m[4]*me[1] + m[7]*me[2] + mb[1] + kI[1] * currentAmps,
+            m[2]*me[0] + m[5]*me[1] + m[8]*me[2] + mb[2] + kI[2] * currentAmps,
         ];
     }
 
@@ -273,6 +278,7 @@ export function createMagFactor(meas, sigma = 0.05) {
         // ∂h/∂δθ in the GLOBAL (world-frame) error convention (q_true = δq(δθ_world) ⊗ q̂):
         //   ∂(Rᵀ·m_earth)/∂δθ_world = Rᵀ·skew(m_earth).   FD- and loop-verified.
         // ∂h/∂m_earth = Rᵀ  (cols 9-11);  ∂h/∂m_body = I  (cols 12-14).
+        // ∂h/∂k_I = currentAmps · I₃  (cols 16-18).
         // Rᵀ row i = [m[i], m[3+i], m[6+i]].
         const rowSkew = (r0, r1, r2) => [
             r1*me2 - r2*me1,
@@ -283,18 +289,25 @@ export function createMagFactor(meas, sigma = 0.05) {
         const t1 = rowSkew(m[1], m[4], m[7]);
         const t2 = rowSkew(m[2], m[5], m[8]);
 
+        // State layout: δp(3) δv(3) δθ(3) b_a(3) b_g(3) m_earth(3) m_body(3) τ(1) k_I(3)
         cachedH = [
-            [0,0,0, 0,0,0, t0[0],t0[1],t0[2], m[0],m[3],m[6], 1,0,0],
-            [0,0,0, 0,0,0, t1[0],t1[1],t1[2], m[1],m[4],m[7], 0,1,0],
-            [0,0,0, 0,0,0, t2[0],t2[1],t2[2], m[2],m[5],m[8], 0,0,1],
+            [0,0,0, 0,0,0, t0[0],t0[1],t0[2], 0,0,0, 0,0,0, m[0],m[3],m[6], 1,0,0, 0, currentAmps,0,0],
+            [0,0,0, 0,0,0, t1[0],t1[1],t1[2], 0,0,0, 0,0,0, m[1],m[4],m[7], 0,1,0, 0, 0,currentAmps,0],
+            [0,0,0, 0,0,0, t2[0],t2[1],t2[2], 0,0,0, 0,0,0, m[2],m[5],m[8], 0,0,1, 0, 0,0,currentAmps],
         ];
         const hp = h(x);
         return [z[0]-hp[0], z[1]-hp[1], z[2]-hp[2]];
     }
 
+    const defaultH = [
+        [0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,1,0,0, 0,currentAmps,0,0],
+        [0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,1,0, 0,0,currentAmps,0],
+        [0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,1, 0,0,0,currentAmps],
+    ];
+
     return {
         h,
-        get H() { return cachedH || [[0,0,0,0,0,0,0,0,0,0,0,0,1,0,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,1,0],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]]; },
+        get H() { return cachedH || defaultH; },
         R: Rnoise,
         residual,
     };
@@ -323,13 +336,13 @@ export function createDeclinationFactor(declRad, sigma = 0.34) {
         const n2e2 = me[0]*me[0] + me[1]*me[1];
         const dHdN = n2e2 > 1e-12 ? -me[1]/n2e2 : 0;
         const dHdE = n2e2 > 1e-12 ? me[0]/n2e2 : 0;
-        cachedH = [[0,0,0,0,0,0,0,0,0, dHdN,dHdE,0, 0,0,0]];
+        cachedH = [[0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0, dHdN,dHdE,0, 0,0,0]];
         return [z - h(x)];
     }
 
     return {
         h,
-        get H() { return cachedH || [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]; },
+        get H() { return cachedH || [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]; },
         R: [[varD]],
         residual,
     };
@@ -346,6 +359,58 @@ export function computeGpsNoise(numSat) {
   if (numSat >= 8)  return 2.5;
   if (numSat >= 5)  return 4.0;
   return 8.0;
+}
+
+/**
+ * GPS position measurement in NED with τ_gps latency.
+ *
+ * Measurement model: h = p − v·τ  (the GPS fix corresponds to state at t−τ).
+ * ∂h/∂p = I₃,  ∂h/∂v = −τ·I₃,  ∂h/∂τ = −v.
+ *
+ * @param {{n: number, e: number, d: number}} meas  NED position (m)
+ * @param {number} [sigma=2.5]  1σ noise in metres
+ * @returns {object} factor
+ */
+export function createGpsPositionFactorWithLatency(meas, sigma = 2.5) {
+    const varP = sigma * sigma;
+
+    let cachedH = null;
+
+    function h(x) {
+        const tau = x.tauGps || 0;
+        return [
+            x.p[0] - x.v[0] * tau,
+            x.p[1] - x.v[1] * tau,
+            x.p[2] - x.v[2] * tau,
+        ];
+    }
+
+    const R = [[varP, 0, 0], [0, varP, 0], [0, 0, varP]];
+
+    function residual(z, x) {
+        const tau = x.tauGps || 0;
+        // H rows for 25-state: δp(0-2), δv(3-5), δθ(6-8), ba(9-11), bg(12-14), me(15-17), mb(18-20), τ(21), kI(22-24)
+        cachedH = [
+            [1,0,0, -tau,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, -x.v[0], 0,0,0],
+            [0,1,0, 0,-tau,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, -x.v[1], 0,0,0],
+            [0,0,1, 0,0,-tau, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, -x.v[2], 0,0,0],
+        ];
+        const hp = h(x);
+        return [z.n - hp[0], z.e - hp[1], z.d - hp[2]];
+    }
+
+    const defaultH = [
+        [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+        [0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+        [0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    ];
+
+    return {
+        h,
+        get H() { return cachedH || defaultH; },
+        R,
+        residual,
+    };
 }
 
 export { GRAVITY_MAG };

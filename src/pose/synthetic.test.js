@@ -4,7 +4,10 @@ import {
     randn,
     generateCircularTrajectory,
     generateStraightTrajectory,
+    generateDynamicTrajectory,
+    generateSensorStreams,
 } from "./synthetic.js";
+import { llhToNed } from "./geodesy.js";
 
 describe("synthetic — PRNG", () => {
     it("same seed gives same sequence", () => {
@@ -89,5 +92,30 @@ describe("synthetic — straight trajectory", () => {
         expect(pEnd.e).toBeGreaterThan(25);
         expect(Math.abs(pEnd.n)).toBeLessThan(1);
         expect(pEnd.e - p0.e).toBeCloseTo(30, 0); // 10 m/s × 3 s
+    });
+});
+
+describe("synthetic — GPS altitude round-trip (Fix 2 gate)", () => {
+    it("GPS↔NED round-trips through test origin to < 20 cm (flat-earth vs WGS84 tolerance)", () => {
+        const origin = { lat: 48.408, lon: -71.164, alt: 200 };
+        const { traj } = generateDynamicTrajectory({ freqHz: 200 });
+        const sensorData = generateSensorStreams(traj, { origin });
+
+        // Verify every GPS fix round-trips back through llhToNed to the trajectory NED
+        let maxAbsErr = 0;
+        for (const gps of sensorData.gps) {
+            const ned = llhToNed(gps.lat, gps.lon, gps.alt, origin.lat, origin.lon, origin.alt);
+            // Find the closest ground-truth pose by time
+            const tS = gps.tUs / 1e6;
+            let best = traj[0];
+            let bestDt = Math.abs(best.t - tS);
+            for (let i = 1; i < traj.length; i++) {
+                const dt = Math.abs(traj[i].t - tS);
+                if (dt < bestDt) { bestDt = dt; best = traj[i]; }
+            }
+            const err = Math.abs(ned.n - best.pNed.n) + Math.abs(ned.e - best.pNed.e) + Math.abs(ned.d - best.pNed.d);
+            if (err > maxAbsErr) maxAbsErr = err;
+        }
+        expect(maxAbsErr, `max NED round-trip error: ${maxAbsErr.toFixed(4)}m`).toBeLessThan(0.2);
     });
 });

@@ -192,6 +192,35 @@ export function FlightLog(logData) {
   };
 
   /**
+   * Get the decoded GPS home coordinate from the first valid H-frame, or null if
+   * the log has no GPS home. Returns { lat, lon, alt } with lat/lon in degrees and
+   * alt in metres MSL.
+   *
+   * NOTE: GPS home is logged in H-frames, a separate frame stream from the main
+   * I/P frames — so its fields (`GPS_home[0..2]`) are NOT in the main field table
+   * and CANNOT be read via getMainFieldIndexByName(). The decoded home lives in the
+   * intraframe directory (`initialGPSHome`, populated by flightlog_index.js from the
+   * H-frame; deleted there when no H-frame exists). Units match the parser/H-frame:
+   * lat/lon are 1e7-scaled integers, alt is decimetres. (Same decode flightlog.js
+   * uses to build the GPS_transform.)
+   */
+  this.getGPSHome = function () {
+    const directory = logIndexes.getIntraframeDirectory(logIndex);
+    const homes = directory.initialGPSHome;
+    if (!homes) return null; // no H-frames present in this log
+    for (const h of homes) {
+      if (h && h.length >= 2 && (h[0] !== 0 || h[1] !== 0)) {
+        return {
+          lat: h[0] / 10000000,
+          lon: h[1] / 10000000,
+          alt: h.length > 2 ? h[2] / 10 : 0,
+        };
+      }
+    }
+    return null;
+  };
+
+  /**
    * Get the index of the field with the given name, or undefined if that field doesn't exist in the log.
    */
   this.getMainFieldIndexByName = function (name) {

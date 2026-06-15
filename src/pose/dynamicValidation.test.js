@@ -12,9 +12,8 @@ import { estimatePoses } from "./estimatorLoop.js";
 describe("dynamic trajectory round-trip (Task A)", () => {
     it("recovers position and attitude on a banked-turn-climb-spin trajectory", () => {
         const { traj } = generateDynamicTrajectory({ freqHz: 200 });
-        const { imu, gps, baro, quat } = generateSensorStreams(traj, { gpsNoiseStd: 0.5 });
-
         const origin = { lat: 48.408, lon: -71.164, alt: 200 };
+        const { imu, gps, baro, quat } = generateSensorStreams(traj, { gpsNoiseStd: 0.5, origin });
 
         const poses = estimatePoses(
             { imu, gps, baro, quat },
@@ -36,7 +35,7 @@ describe("dynamic trajectory round-trip (Task A)", () => {
             const posErr = Math.sqrt(
                 ((est.lat - 48.408) * 111320 - gt.pNed.n) ** 2 +
                 ((est.lon + 71.164) * 111320 * Math.cos(48.408 * Math.PI / 180) - gt.pNed.e) ** 2 +
-                (est.altMsl + gt.pNed.d) ** 2,
+                (-(est.altMsl - origin.alt) - gt.pNed.d) ** 2,
             );
 
             totalPosErr += posErr;
@@ -68,7 +67,8 @@ describe("dynamic trajectory round-trip (Task A)", () => {
 
     it("generates self-consistent sensor streams (level static check)", () => {
         const { traj } = generateDynamicTrajectory({ freqHz: 200 });
-        const { imu, gps, baro, mag } = generateSensorStreams(traj);
+        const origin = { lat: 48.408, lon: -71.164, alt: 200 };
+        const { imu, gps, baro, mag } = generateSensorStreams(traj, { origin });
 
         // First sample: the trajectory starts with a banked attitude right away,
         // so the accel Z should not be exactly 9.81.

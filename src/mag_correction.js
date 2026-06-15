@@ -55,7 +55,44 @@ function computeHeadingWeight(model, m_body) {
 }
 
 /**
+ * Apply ellipsoid + alignment correction to a raw mag reading and return the
+ * body-frame vector on the unit sphere. This is the entrance the 3-axis ESKF
+ * imports for magnetometer fusion — the EKF handles leveling and heading
+ * internally, so undoRollPitch and atan2 are NOT applied here.
+ *
+ * The returned vector is on the unit sphere (W_inv maps the ellipsoid to a
+ * sphere of radius 1). The ADC→Gauss scale factor is returned separately for
+ * consumers that need physical units (e.g. |B| magnitude gates).
+ *
+ * @param {number[3]} magRaw - Raw mag ADC values from the log [x, y, z]
+ * @param {MagModel} model - Loaded characterization model
+ * @returns {{ mBody: number[3], gaussPerCorrectedUnit: number|null }|null}
+ */
+export function correctMagToBody(magRaw, model) {
+    if (!magRaw || magRaw.length < 3) return null;
+    if (magRaw[0] === 0 && magRaw[1] === 0 && magRaw[2] === 0) return null;
+
+    // Step 1: Ellipsoid correction — maps to unit sphere (radius = 1)
+    const mCorrected = applyEllipsoidCorrection(magRaw, model.ellipsoid);
+
+    // Step 2: Sensor → body alignment
+    const mBody = mat3mulVec(model.alignment.matrix, mCorrected);
+
+    // ADC→Gauss scale factor from the fusion block (computed or native)
+    const gaussPerUnit = model.fusion?.gaussPerCorrectedUnit ?? null;
+
+    return {
+        mBody,
+        gaussPerCorrectedUnit: gaussPerUnit,
+    };
+}
+
+/**
  * Apply the full mag correction pipeline for a single sample.
+ *
+ * Internally calls correctMagToBody for steps 1–2, then applies
+ * undoRollPitch + atan2 for heading extraction. Byte-for-byte identical
+ * to the pre-refactor shipped code; the heading path is unchanged.
  *
  * @param {number[3]} magRaw - Raw mag ADC values from the log [x, y, z]
  * @param {number} rollRad - Roll angle in radians
@@ -64,28 +101,22 @@ function computeHeadingWeight(model, m_body) {
  * @returns {{ heading: number, weight: number, magCorrected: number[3] }|null}
  */
 export function correctMagSample(magRaw, rollRad, pitchRad, model) {
-    if (!magRaw || magRaw.length < 3) return null;
-    if (magRaw[0] === 0 && magRaw[1] === 0 && magRaw[2] === 0) return null;
-
-    // Step 1: Ellipsoid correction
-    const mCorrected = applyEllipsoidCorrection(magRaw, model.ellipsoid);
-
-    // Step 2: Sensor → body alignment
-    const mBody = mat3mulVec(model.alignment.matrix, mCorrected);
+    const bodyResult = correctMagToBody(magRaw, model);
+    if (!bodyResult) return null;
 
     // Step 3: Level to horizontal frame
-    const mLeveled = undoRollPitch(mBody, rollRad, pitchRad);
+    const mLeveled = undoRollPitch(bodyResult.mBody, rollRad, pitchRad);
 
     // Step 4: NED heading (atan2 of -East / North)
     const hMag = Math.atan2(-mLeveled[1], mLeveled[0]);
 
     // Step 5: Analytic fusion weight
-    const weight = computeHeadingWeight(model, mBody);
+    const weight = computeHeadingWeight(model, bodyResult.mBody);
 
     return {
         heading: hMag,
         weight,
-        magCorrected: mCorrected,
+        magCorrected: bodyResult.mBody,  // body-frame corrected (same as old magCorrected)
     };
 }
 

@@ -313,6 +313,30 @@ export function quatToEuler(q) {
   return { roll, pitch, yaw };
 }
 
+/**
+ * Build a unit quaternion from ZYX intrinsic Euler angles (radians).
+ * The resulting quaternion maps body(FRD) → world(NED) with standard
+ * right-handed yaw (0°=North, CW+).
+ *
+ * Order of rotations (applied first-to-last): yaw about Z, pitch about Y, roll about X.
+ *
+ * @param {number} roll  - radians
+ * @param {number} pitch - radians
+ * @param {number} yaw   - radians
+ * @returns {number[]} Unit quaternion [w, x, y, z]
+ */
+export function eulerToQuat(roll, pitch, yaw) {
+    const cr = Math.cos(roll * 0.5), sr = Math.sin(roll * 0.5);
+    const cp = Math.cos(pitch * 0.5), sp = Math.sin(pitch * 0.5);
+    const cy = Math.cos(yaw * 0.5), sy = Math.sin(yaw * 0.5);
+    return [
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    ];
+}
+
 // ---------------------------------------------------------------------------
 // IMU strapdown mechanization
 // ---------------------------------------------------------------------------

@@ -333,6 +333,7 @@ export function generateDynamicTrajectory(opts = {}) {
  * @param {number} [opts.gpsNoiseStd=0] - GPS position noise 1σ (m), 0 = noise-free
  * @param {number} [opts.gyroNoiseStd=0] - gyro noise 1σ (rad/s)
  * @param {number} [opts.accelNoiseStd=0] - accel noise 1σ (m/s²)
+ * @param {{lat:number, lon:number, alt:number}} [opts.origin] - geodetic origin for GPS alt round-trip
  * @returns {{ imu: ImuSample[], gps: GpsFix[], baro: BaroSample[], quat: object[], mag: object[] }}
  */
 export function generateSensorStreams(traj, opts = {}) {
@@ -343,9 +344,11 @@ export function generateSensorStreams(traj, opts = {}) {
         gpsNoiseStd: _gpsNoiseStd = 0,
         gyroNoiseStd = 0,
         accelNoiseStd = 0,
+        origin = null,
     } = opts;
 
     const g = 9.80665;
+    const originAlt = origin ? origin.alt : 0;
     const imu = [], gpsList = [], baro = [], quat = [], mag = [];
     let lastQ = null;
     const dt = traj.length > 1 ? traj[1].t - traj[0].t : 0.01;
@@ -406,7 +409,7 @@ export function generateSensorStreams(traj, opts = {}) {
                 tUs,
                 lat: 48.408 + pose.pNed.n / 111320,
                 lon: -71.164 + pose.pNed.e / (111320 * Math.cos(48.408 * Math.PI / 180)),
-                alt: -pose.pNed.d,
+                alt: originAlt - pose.pNed.d,
                 velNed: [
                     pose.vNed.n + (rng ? randn(rng, 0, 0.3) : 0),
                     pose.vNed.e + (rng ? randn(rng, 0, 0.3) : 0),

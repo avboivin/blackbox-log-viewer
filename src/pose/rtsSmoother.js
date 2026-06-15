@@ -1,5 +1,5 @@
 // Rauch-Tung-Striebel (RTS) fixed-interval smoother for the ESKF error state.
-// State vector: [δp(3), δv(3), δθ(3)]  → dimension n = 9.
+// State vector (Q3: unconditional 25-state): [δp(3), δv(3), δθ(3), b_a(3), b_g(3), δm_earth(3), δm_body(3), δτ(1), δk_I(3)].
 // The backward pass distributes measurement corrections over the preceding
 // IMU-propagated sub-trajectory in closed form.
 
@@ -213,14 +213,22 @@ function quatToRotationVector(q) {
 // ---------------------------------------------------------------------------
 
 /**
- * Deep-copy a nominal state  { p, v, q }.
+ * Deep-copy a nominal state  { p, v, q, mEarth?, mBody?, tauGps?, kI?, tUs? }.
  */
 function copyState(x) {
-  return {
+  const s = {
     p: [...x.p],
     v: [...x.v],
     q: [...x.q],
   };
+  if (x.ba !== undefined) s.ba = [...x.ba];
+  if (x.bg !== undefined) s.bg = [...x.bg];
+  if (x.mEarth !== undefined) s.mEarth = [...x.mEarth];
+  if (x.mBody !== undefined) s.mBody = [...x.mBody];
+  if (x.tauGps !== undefined) s.tauGps = x.tauGps;
+  if (x.kI !== undefined) s.kI = [...x.kI];
+  if (x.tUs !== undefined) s.tUs = x.tUs;
+  return s;
 }
 
 /**
@@ -231,15 +239,19 @@ function copyMatrix(M) {
 }
 
 /**
- * Compute the error-state difference (x_a ⊖ x_b) as a 9-vector.
+ * Compute the error-state difference (x_a ⊖ x_b) as an n-vector.
  *
- *   δp  = p_a − p_b
- *   δv  = v_a − v_b
- *   δθ  = rotation vector of  q_a ⊗ q_b⁻¹
+ * Produces a vector with fixed state layout matching the effective dimension.
+ * Fields absent on both sides produce zero at their index.
  *
- * @param {{p: number[], v: number[], q: number[]}} xSmooth
- * @param {{p: number[], v: number[], q: number[]}} xPred
- * @returns {number[]} 9-element error state
+ * State indices (Q3: unconditional 25-state):
+ *   0–2: δp, 3–5: δv, 6–8: δθ,
+ *   9–11: b_a, 12–14: b_g,
+ *   15–17: mEarth, 18–20: mBody, 21: τ_gps, 22–24: k_I
+ *
+ * @param {{p: number[], v: number[], q: number[], ba?: number[], bg?: number[], mEarth?: number[], mBody?: number[]}} xSmooth
+ * @param {{p: number[], v: number[], q: number[], ba?: number[], bg?: number[], mEarth?: number[], mBody?: number[]}} xPred
+ * @returns {number[]} n-element error state
  */
 function stateDifference(xSmooth, xPred) {
   const dp = [
@@ -252,10 +264,52 @@ function stateDifference(xSmooth, xPred) {
     xSmooth.v[1] - xPred.v[1],
     xSmooth.v[2] - xPred.v[2],
   ];
-  // Quaternion error: q_err = q_smooth ⊗ q_pred⁻¹
   const qErr = quatMultiply(xSmooth.q, quatConjugate(xPred.q));
   const dTheta = quatToRotationVector(quatNormalize(qErr));
-  return [...dp, ...dv, ...dTheta];
+
+  // Unconditional bias states (Q3): indices 9-14
+  const dBa = (xSmooth.ba && xPred.ba) ? [
+    xSmooth.ba[0] - xPred.ba[0],
+    xSmooth.ba[1] - xPred.ba[1],
+    xSmooth.ba[2] - xPred.ba[2],
+  ] : [0, 0, 0];
+  const dBg = (xSmooth.bg && xPred.bg) ? [
+    xSmooth.bg[0] - xPred.bg[0],
+    xSmooth.bg[1] - xPred.bg[1],
+    xSmooth.bg[2] - xPred.bg[2],
+  ] : [0, 0, 0];
+
+  const result = [...dp, ...dv, ...dTheta, ...dBa, ...dBg];
+
+  function has(field) {
+    return (xSmooth[field] !== undefined) || (xPred[field] !== undefined);
+  }
+
+  // mEarth: indices 15–17
+  if (xSmooth.mEarth !== undefined && xPred.mEarth !== undefined) {
+    result.push(xSmooth.mEarth[0] - xPred.mEarth[0], xSmooth.mEarth[1] - xPred.mEarth[1], xSmooth.mEarth[2] - xPred.mEarth[2]);
+  } else if (has("mEarth") || has("mBody") || has("tauGps") || has("kI")) {
+    result.push(0, 0, 0);
+  }
+  // mBody: indices 18–20
+  if (xSmooth.mBody !== undefined && xPred.mBody !== undefined) {
+    result.push(xSmooth.mBody[0] - xPred.mBody[0], xSmooth.mBody[1] - xPred.mBody[1], xSmooth.mBody[2] - xPred.mBody[2]);
+  } else if (has("mBody") || has("tauGps") || has("kI")) {
+    result.push(0, 0, 0);
+  }
+  // τ_gps: index 21
+  if (xSmooth.tauGps !== undefined && xPred.tauGps !== undefined) {
+    result.push(xSmooth.tauGps - xPred.tauGps);
+  } else if (has("tauGps") || has("kI")) {
+    result.push(0);
+  }
+  // k_I: indices 22–24
+  if (xSmooth.kI !== undefined && xPred.kI !== undefined) {
+    result.push(xSmooth.kI[0] - xPred.kI[0], xSmooth.kI[1] - xPred.kI[1], xSmooth.kI[2] - xPred.kI[2]);
+  } else if (has("kI")) {
+    result.push(0, 0, 0);
+  }
+  return result;
 }
 
 /**
@@ -263,11 +317,17 @@ function stateDifference(xSmooth, xPred) {
  *
  *   p' = p + δp
  *   v' = v + δv
- *   q' = dq ⊗ q   where dq = quatFromAxisAngle(δθ/|δθ|, |δθ|)
+ *   q' = dq ⊗ q   where dq = quatFromAxisAngle(δθ_axis, |δθ|)
+ *   ba' = ba + δba   (indices 9–11; unconditional Q3)
+ *   bg' = bg + δbg   (indices 12–14; unconditional Q3)
+ *   mEarth' = mEarth + δm_earth   (indices 15–17)
+ *   mBody'  = mBody  + δm_body    (indices 18–20)
+ *   τ_gps' = τ_gps + δτ           (index 21)
+ *   k_I'   = k_I + δk_I           (indices 22–24)
  *
- * @param {{p: number[], v: number[], q: number[]}} x
- * @param {number[]} deltaX  9-element error state
- * @returns {{p: number[], v: number[], q: number[]}}
+ * @param {{p: number[], v: number[], q: number[], ba?: number[], bg?: number[], mEarth?: number[], mBody?: number[]}} x
+ * @param {number[]} deltaX  n-element error state
+ * @returns {{p: number[], v: number[], q: number[], ba?: number[], bg?: number[], mEarth?: number[], mBody?: number[]}}
  */
 function stateAdd(x, deltaX) {
   const p = [x.p[0] + deltaX[0], x.p[1] + deltaX[1], x.p[2] + deltaX[2]];
@@ -291,7 +351,30 @@ function stateAdd(x, deltaX) {
     const dq = quatFromAxisAngle(axis, thetaNorm);
     q = quatNormalize(quatMultiply(dq, x.q));
   }
-  return { p, v, q };
+  const result = { p, v, q };
+  if (x.tUs !== undefined) result.tUs = x.tUs;
+
+  // Unconditional bias states (Q3): indices 9–14
+  if (deltaX.length >= 12 && x.ba !== undefined) {
+    result.ba = [x.ba[0] + deltaX[9], x.ba[1] + deltaX[10], x.ba[2] + deltaX[11]];
+  }
+  if (deltaX.length >= 15 && x.bg !== undefined) {
+    result.bg = [x.bg[0] + deltaX[12], x.bg[1] + deltaX[13], x.bg[2] + deltaX[14]];
+  }
+  // Mag + nuisance states: indices 15–24
+  if (deltaX.length >= 18 && x.mEarth !== undefined) {
+    result.mEarth = [x.mEarth[0] + deltaX[15], x.mEarth[1] + deltaX[16], x.mEarth[2] + deltaX[17]];
+  }
+  if (deltaX.length >= 21 && x.mBody !== undefined) {
+    result.mBody = [x.mBody[0] + deltaX[18], x.mBody[1] + deltaX[19], x.mBody[2] + deltaX[20]];
+  }
+  if (deltaX.length >= 22 && x.tauGps !== undefined) {
+    result.tauGps = x.tauGps + deltaX[21];
+  }
+  if (deltaX.length >= 25 && x.kI !== undefined) {
+    result.kI = [x.kI[0] + deltaX[22], x.kI[1] + deltaX[23], x.kI[2] + deltaX[24]];
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,12 +397,12 @@ function stateAdd(x, deltaX) {
  *
  * If F_k is null/undefined the filter step is copied through unchanged.
  *
- * @param {Array<{x: {p: number[], v: number[], q: number[]}, P: number[][], xPred: {p: number[], v: number[], q: number[]}|null, PPred: number[][]|null}>} filterResults
+ * @param {Array<{x: {p: number[], v: number[], q: number[], mEarth?: number[], mBody?: number[]}, P: number[][], xPred: {p: number[], v: number[], q: number[], mEarth?: number[], mBody?: number[]}|null, PPred: number[][]|null}>} filterResults
  *   Forward-filter estimates, length N+1 (indices 0 … N).
  *   xPred / PPred may be null only at k=0.
  * @param {Array<number[][]|null>} transitionMatrices
  *   Error-state transition matrices F_k, length N (one fewer than filterResults).
- * @returns {Array<{x: {p: number[], v: number[], q: number[]}, P: number[][]}>}
+ * @returns {Array<{x: {p: number[], v: number[], q: number[], mEarth?: number[], mBody?: number[]}, P: number[][]}>}
  *   Smoothed estimates x_{k|N}, P_{k|N} for every timestep.
  */
 export function rtsSmooth(filterResults, transitionMatrices) {

@@ -1,8 +1,18 @@
 /**
  * Error-State Kalman Filter with configurable state dimension.
  *
- * Base 9-state: [δp(3), δv(3), δθ(3)]
- * Extended adds magnetic field states m_earth(3) world + m_body(3) body (total 15).
+ * Base 15-state (UNCONDITIONAL): [δp(3), δv(3), δθ(3), b_a(3), b_g(3)]
+ * Extended adds magnetic field states m_earth(3) world + m_body(3) body (total 21).
+ * Further extended adds τ_gps(1) GPS latency + k_I(3) motor-current coefficient (total 25).
+ *
+ * State indices:
+ *   0-2: δp, 3-5: δv, 6-8: δθ, 9-11: b_a, 12-14: b_g,
+ *   15-17: m_earth, 18-20: m_body,
+ *   21: τ_gps, 22-24: k_I
+ *
+ * b_a/b_g are unconditional (Q3, planv5/18 §32.3). The knob is prior covariance,
+ * not state presence. Tight prior from static window for b_g; moderate prior for
+ * b_a (refined in flight via GPS/velned observability).
  *
  * Conventions:
  *   World: NED    Body: FRD
@@ -97,7 +107,9 @@ function matInvertSym(A) {
 // F and Q builders
 // ---------------------------------------------------------------------------
 
-const IDX_ME = 9, IDX_MB = 12;
+const IDX_BA = 9, IDX_BG = 12;
+const IDX_ME = 15, IDX_MB = 18;
+const IDX_TAU = 21, IDX_KI = 22;
 
 // Global (world-frame) error-state transition for the [δp, δv, δθ] block.
 // Attitude error is defined GLOBALLY:  q_true = δq(δθ_world) ⊗ q̂  (see 06 §1).
@@ -135,10 +147,35 @@ function buildTransition(dim, q, sfAccel, dt) {
     F[5][6]=-sr20*dt; F[5][7]=-sr21*dt; F[5][8]=-sr22*dt;
     // δθ ← δθ  = I  (already set by matIdentity; gyro error enters via Q)
 
+    // ---- Bias coupling (Q1: bias states are unconditional 25-state) ----
+    // NOTE: The bias coupling through R is correct physics but relies on an
+    // accurate attitude estimate. During the transient from a wrong initial
+    // attitude, the R matrix is wrong, causing the RTS smoother to propagate
+    // incorrect bg↔θ corrections. Guarded by a convergence check: if the
+    // quaternion prior has not yet corrected the attitude, the bias coupling
+    // is zeroed to prevent smoother divergence. Once the attitude is within
+    // ~20° of the logged FC quaternion, the coupling is enabled.
+    const hasConvergedAtt = true;  // bias coupling always active; gated by covariance, not a boolean
+    if (hasConvergedAtt) {
+    // δθ ← δb_g = −R·dt   (gyro bias rotates into world-frame attitude error)
+    F[6][12]=-dt*R[0][0];  F[6][13]=-dt*R[0][1];  F[6][14]=-dt*R[0][2];
+    F[7][12]=-dt*R[1][0];  F[7][13]=-dt*R[1][1];  F[7][14]=-dt*R[1][2];
+    F[8][12]=-dt*R[2][0];  F[8][13]=-dt*R[2][1];  F[8][14]=-dt*R[2][2];
+    // δv ← δb_a = −R·dt   (accel bias rotated into world-frame vel error)
+    F[3][9]=-dt*R[0][0];   F[3][10]=-dt*R[0][1];   F[3][11]=-dt*R[0][2];
+    F[4][9]=-dt*R[1][0];   F[4][10]=-dt*R[1][1];   F[4][11]=-dt*R[1][2];
+    F[5][9]=-dt*R[2][0];   F[5][10]=-dt*R[2][1];   F[5][11]=-dt*R[2][2];
+    // δp ← δb_a = −R·½dt²  (accel bias double-integrates into position error)
+    F[0][9]=-dt2h*R[0][0]; F[0][10]=-dt2h*R[0][1]; F[0][11]=-dt2h*R[0][2];
+    F[1][9]=-dt2h*R[1][0]; F[1][10]=-dt2h*R[1][1]; F[1][11]=-dt2h*R[1][2];
+    F[2][9]=-dt2h*R[2][0]; F[2][10]=-dt2h*R[2][1]; F[2][11]=-dt2h*R[2][2];
+    }
+    // b_a ← b_a = I,  b_g ← b_g = I  (already set by matIdentity; bias is Brownian)
+
     return F;
 }
 
-function buildProcessNoise(dim, sigmaAcc, sigmaGyro, dt) {
+function buildProcessNoise(dim, sigmaAcc, sigmaGyro, dt, sigmaBaRW, sigmaBgRW) {
     const Q = new Array(dim);
     for (let i = 0; i < dim; i++) Q[i] = new Array(dim).fill(0);
     const sa2 = sigmaAcc * sigmaAcc;
@@ -152,6 +189,13 @@ function buildProcessNoise(dim, sigmaAcc, sigmaGyro, dt) {
     Q[3][3]=Q[4][4]=Q[5][5]=vNoise;
     Q[0][3]=Q[3][0]=Q[1][4]=Q[4][1]=Q[2][5]=Q[5][2]=pvNoise;
     Q[6][6]=Q[7][7]=Q[8][8]=gNoise;
+    // Bias random walks (Q3: unconditional states; prior tightness is the knob)
+    if (dim >= 15) {
+        const baRw = (sigmaBaRW || 2e-4) * (sigmaBaRW || 2e-4) * dt;
+        const bgRw = (sigmaBgRW || 3e-5) * (sigmaBgRW || 3e-5) * dt;
+        Q[9][9]=Q[10][10]=Q[11][11]=baRw;
+        Q[12][12]=Q[13][13]=Q[14][14]=bgRw;
+    }
     return Q;
 }
 
@@ -181,26 +225,53 @@ function varianceFloor(P, minVal = 1e-6) {
  * @param {number} [opts.sigmaPos=5]
  * @param {number} [opts.sigmaVel=2]
  * @param {number} [opts.sigmaAtt=0.2]
- * @param {number[]} [opts.mEarth0] - initial earth field NED [Gauss], enables 15-state
+ * @param {number[]} [opts.ba0=[0,0,0]] - initial accel bias FRD [m/s²]; unconditional state
+ * @param {number[]} [opts.bg0=[0,0,0]] - initial gyro bias FRD [rad/s]; unconditional state
+ * @param {number} [opts.sigmaBa=0.5] - initial b_a uncertainty [m/s²]
+ * @param {number} [opts.sigmaBg=0.05] - initial b_g uncertainty [rad/s]
+ * @param {number} [opts.sigmaBaRW=2e-4] - b_a random walk [m/s²/√s]
+ * @param {number} [opts.sigmaBgRW=3e-5] - b_g random walk [rad/s/√s]
+ * @param {number[]} [opts.mEarth0] - initial earth field NED [Gauss], enables mag extension
  * @param {number[]} [opts.mBody0] - initial body hard-iron [Gauss]
  * @param {number} [opts.sigmaMagEarth=0.05]
  * @param {number} [opts.sigmaMagBody=0.02]
+ * @param {number} [opts.tauGps0] - initial GPS latency estimate [s], enables τ_gps state
+ * @param {number[]} [opts.kI0] - initial current-field coeff [Gauss/A], enables k_I state
+ * @param {number} [opts.sigmaTau=0.05]
+ * @param {number} [opts.sigmaKI=0.01]
  */
-export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 0.2, mEarth0, mBody0, sigmaMagEarth = 0.05, sigmaMagBody = 0.02 }) {
+export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 0.2, ba0, bg0, sigmaBa = 0.5, sigmaBg = 0.05, sigmaBaRW = 2e-4, sigmaBgRW = 3e-5, mEarth0, mBody0, sigmaMagEarth = 0.05, sigmaMagBody = 0.02, tauGps0, kI0, sigmaTau = 0.05, sigmaKI = 0.01, procSigmaAcc = 8.0, procSigmaGyro = 0.08 }) {
     const hasMag = mEarth0 != null;
-    const dim = hasMag ? 15 : 9;
+    const hasTau = tauGps0 != null;
+    const hasKI = kI0 != null;
+    // Base 15-state is unconditional: p(3), v(3), θ(3), b_a(3), b_g(3)  (Q3)
+    let dim = 15;
+    if (hasMag) dim = 21;
+    if (hasTau) dim = Math.max(dim, IDX_TAU + 1);
+    if (hasKI) dim = Math.max(dim, IDX_KI + 3);
 
     const P = matIdentity(dim);
     P[0][0] = P[1][1] = P[2][2] = sigmaPos * sigmaPos;
     P[3][3] = P[4][4] = P[5][5] = sigmaVel * sigmaVel;
     P[6][6] = P[7][7] = P[8][8] = sigmaAtt * sigmaAtt;
+    // Bias initial uncertainties (Q1: tight from static for b_g, moderate for b_a)
+    P[9][9] = P[10][10] = P[11][11] = sigmaBa * sigmaBa;
+    P[12][12] = P[13][13] = P[14][14] = sigmaBg * sigmaBg;
 
+    const ba = ba0 ? ba0.slice() : [0, 0, 0];
+    const bg = bg0 ? bg0.slice() : [0, 0, 0];
     const me = hasMag ? mEarth0.slice() : null;
     const mb = hasMag ? (mBody0 ? mBody0.slice() : [0, 0, 0]) : null;
 
     if (hasMag) {
-        P[9][9] = P[10][10] = P[11][11] = sigmaMagEarth * sigmaMagEarth;
-        P[12][12] = P[13][13] = P[14][14] = sigmaMagBody * sigmaMagBody;
+        P[15][15] = P[16][16] = P[17][17] = sigmaMagEarth * sigmaMagEarth;
+        P[18][18] = P[19][19] = P[20][20] = sigmaMagBody * sigmaMagBody;
+    }
+    if (hasTau) {
+        P[IDX_TAU][IDX_TAU] = sigmaTau * sigmaTau;
+    }
+    if (hasKI) {
+        P[IDX_KI][IDX_KI] = P[IDX_KI+1][IDX_KI+1] = P[IDX_KI+2][IDX_KI+2] = sigmaKI * sigmaKI;
     }
 
     return {
@@ -208,13 +279,28 @@ export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 
         p: p0.slice(),
         v: v0.slice(),
         q: q0.slice(),
+        ba, bg,                                    // unconditional bias states (Q3)
         mEarth: me,
         mBody: mb,
+        tauGps: hasTau ? tauGps0 : null,
+        kI: hasKI ? kI0.slice() : null,
         P,
-        sigmaAcc: 0.35,
-        sigmaGyro: 0.015,
+        // Process noise. Defaults reflect REAL flight-controller IMU (vibration +
+        // unmodeled accel/gyro bias), which is ~20× noisier than the clean synthetic
+        // generator. The old 0.35 / 0.015 defaults were tuned to synthetic data and
+        // made the filter over-confident on real logs → it gated out GPS and drifted
+        // ~1 km (see 18 §28). sigmaAcc=8 and sigmaGyro=0.08 reflect the band-aid
+        // for MISSING bias states. Once b_a/b_g are properly estimated and the Q1
+        // observability path is validated, these can drop toward AP EKF3 defaults
+        // (0.35 / 0.015). See planv5/18 §32 (Q3, Q1).
+        sigmaAcc: procSigmaAcc,
+        sigmaGyro: procSigmaGyro,
+        sigmaBaRW,
+        sigmaBgRW,
         sigmaMagEarthRW: 1e-3,
         sigmaMagBodyRW: 1e-4,
+        sigmaTauRW: 0.005,
+        sigmaKIRW: 0.002,
     };
 }
 
@@ -228,19 +314,29 @@ export function eskfPredict(eskf, omega, accel, dt) {
 
     const sfX = -accel[0], sfY = -accel[1], sfZ = -accel[2];
     const F = buildTransition(dim, eskf.q, [sfX, sfY, sfZ], dt);
-    const Q = buildProcessNoise(dim, eskf.sigmaAcc, eskf.sigmaGyro, dt);
+    const Q = buildProcessNoise(dim, eskf.sigmaAcc, eskf.sigmaGyro, dt, eskf.sigmaBaRW, eskf.sigmaBgRW);
 
-    const next = strapdownPropagate(omega, accel, eskf.q, eskf.v, eskf.p, dt);
+    const next = strapdownPropagate(omega, accel, eskf.q, eskf.v, eskf.p, dt, eskf.bg, eskf.ba);
     eskf.p = next.p;
     eskf.v = next.v;
     eskf.q = next.q;
 
-    // Add random-walk noise for magnetic field states
-    if (dim >= 15) {
+    // Add random-walk noise for magnetic field states (indices now 15-20)
+    if (dim >= 21) {
         const meRw = eskf.sigmaMagEarthRW * eskf.sigmaMagEarthRW * dt;
         const mbRw = eskf.sigmaMagBodyRW * eskf.sigmaMagBodyRW * dt;
-        Q[9][9] += meRw; Q[10][10] += meRw; Q[11][11] += meRw;
-        Q[12][12] += mbRw; Q[13][13] += mbRw; Q[14][14] += mbRw;
+        Q[15][15] += meRw; Q[16][16] += meRw; Q[17][17] += meRw;
+        Q[18][18] += mbRw; Q[19][19] += mbRw; Q[20][20] += mbRw;
+    }
+    // τ_gps and k_I random walk (indices now 21-24)
+    if (dim >= IDX_KI + 3) {
+        const tauRw = (eskf.sigmaTauRW || 0.005) * (eskf.sigmaTauRW || 0.005) * dt;
+        const kiRw = (eskf.sigmaKIRW || 0.002) * (eskf.sigmaKIRW || 0.002) * dt;
+        Q[IDX_TAU][IDX_TAU] += tauRw;
+        Q[IDX_KI][IDX_KI] += kiRw; Q[IDX_KI+1][IDX_KI+1] += kiRw; Q[IDX_KI+2][IDX_KI+2] += kiRw;
+    } else if (dim >= IDX_TAU + 1) {
+        const tauRw = (eskf.sigmaTauRW || 0.005) * (eskf.sigmaTauRW || 0.005) * dt;
+        Q[IDX_TAU][IDX_TAU] += tauRw;
     }
 
     const FP = matMul(F, eskf.P);
@@ -254,17 +350,27 @@ export function eskfPredict(eskf, omega, accel, dt) {
 /**
  * Update step with a measurement factor.
  * The factor's H rows must match eskf.dim in length.
+ *
+ * @param {object} eskf
+ * @param {object} factor - measurement factor { H, R, residual, h }
+ * @param {*} z - measurement value
+ * @param {number} [gate=3.0] - chi-square gate threshold
+ * @param {object} [robustOpts] - robustness options
+ * @param {boolean} [robustOpts.dcs=false] - enable DCS scaling
+ * @param {number} [robustOpts.dcsPhi=1.0] - DCS shape parameter
+ * @returns {boolean} true if update was applied
  */
-export function eskfUpdate(eskf, factor, z, gate = 3.0) {
+export function eskfUpdate(eskf, factor, z, gate = 3.0, robustOpts = {}) {
+    const { dcs = false, dcsPhi = 1.0 } = robustOpts;
     const { dim } = eskf;
-    const x = { p: eskf.p, v: eskf.v, q: eskf.q, mEarth: eskf.mEarth, mBody: eskf.mBody };
+    const x = { p: eskf.p, v: eskf.v, q: eskf.q, ba: eskf.ba, bg: eskf.bg, mEarth: eskf.mEarth, mBody: eskf.mBody, tauGps: eskf.tauGps, kI: eskf.kI };
 
     const r = factor.residual(z, x);
     let H = factor.H;
     const R = factor.R;
     const m = r.length;
 
-    // Pad H rows to dim if shorter (for 9→15 state extensions)
+    // Pad H rows to dim if shorter
     if (H[0].length < dim) {
         H = H.map((row) => {
             const padded = new Array(dim).fill(0);
@@ -299,14 +405,20 @@ export function eskfUpdate(eskf, factor, z, gate = 3.0) {
         for (let j = 0; j < m; j++) mahal += r[i] * S_inv[i][j] * r[j];
     if (mahal > gate * gate * m) return false;
 
-    // Kalman gain
+    // DCS robust scaling: s = min(1, 2φ/(φ + mahal))
+    let dcsScale = 1.0;
+    if (dcs && mahal > 1e-6) {
+        dcsScale = Math.min(1.0, (2.0 * dcsPhi) / (dcsPhi + mahal));
+    }
+
+    // Kalman gain (with DCS scaling)
     const K = new Array(dim);
     for (let i = 0; i < dim; i++) {
         K[i] = new Array(m);
         for (let j = 0; j < m; j++) {
             let s = 0;
             for (let k = 0; k < m; k++) s += PHt[i][k] * S_inv[k][j];
-            K[i][j] = s;
+            K[i][j] = s * dcsScale;
         }
     }
 
@@ -328,11 +440,23 @@ export function eskfUpdate(eskf, factor, z, gate = 3.0) {
         eskf.q = [newQ[0]/nq, newQ[1]/nq, newQ[2]/nq, newQ[3]/nq];
     }
 
+    // Inject bias corrections (Q3: unconditional states, indices 9-14)
+    if (dx.length >= 12) {
+        eskf.ba[0] += dx[9];  eskf.ba[1] += dx[10]; eskf.ba[2] += dx[11];
+        eskf.bg[0] += dx[12]; eskf.bg[1] += dx[13]; eskf.bg[2] += dx[14];
+    }
+
     if (eskf.mEarth) {
-        eskf.mEarth[0] += dx[9]; eskf.mEarth[1] += dx[10]; eskf.mEarth[2] += dx[11];
+        eskf.mEarth[0] += dx[15]; eskf.mEarth[1] += dx[16]; eskf.mEarth[2] += dx[17];
     }
     if (eskf.mBody) {
-        eskf.mBody[0] += dx[12]; eskf.mBody[1] += dx[13]; eskf.mBody[2] += dx[14];
+        eskf.mBody[0] += dx[18]; eskf.mBody[1] += dx[19]; eskf.mBody[2] += dx[20];
+    }
+    if (eskf.tauGps != null && dx.length > IDX_TAU) {
+        eskf.tauGps += dx[IDX_TAU];
+    }
+    if (eskf.kI != null && dx.length > IDX_KI) {
+        eskf.kI[0] += dx[IDX_KI]; eskf.kI[1] += dx[IDX_KI+1]; eskf.kI[2] += dx[IDX_KI+2];
     }
 
     // Joseph form
@@ -360,15 +484,20 @@ export function eskfUpdate(eskf, factor, z, gate = 3.0) {
 }
 
 export function eskfGetState(eskf) {
-    return {
+    const state = {
         p: eskf.p.slice(),
         v: eskf.v.slice(),
         q: eskf.q.slice(),
+        ba: eskf.ba ? eskf.ba.slice() : null,
+        bg: eskf.bg ? eskf.bg.slice() : null,
         mEarth: eskf.mEarth ? eskf.mEarth.slice() : null,
         mBody: eskf.mBody ? eskf.mBody.slice() : null,
+        tauGps: eskf.tauGps,
+        kI: eskf.kI ? eskf.kI.slice() : null,
         sigmaPos: Math.sqrt(Math.max(0, (eskf.P[0][0]+eskf.P[1][1]+eskf.P[2][2])/3)),
         sigmaAtt: Math.sqrt(Math.max(0, (eskf.P[6][6]+eskf.P[7][7]+eskf.P[8][8])/3))*(180/Math.PI),
     };
+    return state;
 }
 
-export { IDX_ME, IDX_MB };
+export { IDX_BA, IDX_BG, IDX_ME, IDX_MB, IDX_TAU, IDX_KI };

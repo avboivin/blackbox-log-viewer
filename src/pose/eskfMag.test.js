@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createEskf, eskfUpdate } from "./eskf.js";
 import { createMagFactor, createDeclinationFactor } from "./measurements.js";
 
-describe("eskf — 15-state with mag fusion", () => {
+describe("eskf — 21-state with mag fusion (Q3: unconditional 15-state base + 6 mag)", () => {
     it("initializes with magnetic field states", () => {
         const eskf = createEskf({
             p0: [0, 0, -200],
@@ -12,23 +12,28 @@ describe("eskf — 15-state with mag fusion", () => {
             mBody0: [0, 0, 0],
         });
 
-        expect(eskf.dim).toBe(15);
+        expect(eskf.dim).toBe(21);      // 15 base (inc. unconditional b_a/b_g) + 6 mag
         expect(eskf.mEarth).toEqual([0.17, -0.047, 0.51]);
         expect(eskf.mBody).toEqual([0, 0, 0]);
-        expect(eskf.P.length).toBe(15);
-        expect(eskf.P[0].length).toBe(15);
+        expect(eskf.P.length).toBe(21);
+        expect(eskf.P[0].length).toBe(21);
+        // Bias states are always present (Q3)
+        expect(eskf.ba).toEqual([0, 0, 0]);
+        expect(eskf.bg).toEqual([0, 0, 0]);
     });
 
-    it("9-state ESKF still works (backward compat)", () => {
+    it("15-state base ESKF works (no mag; unconditional b_a/b_g, Q3)", () => {
         const eskf = createEskf({
             p0: [0, 0, -200],
             v0: [7, 7, 0],
             q0: [1, 0, 0, 0],
         });
 
-        expect(eskf.dim).toBe(9);
+        expect(eskf.dim).toBe(15);      // unconditional b_a/b_g always present
         expect(eskf.mEarth).toBeNull();
-        expect(eskf.P.length).toBe(9);
+        expect(eskf.P.length).toBe(15);
+        expect(eskf.ba).toEqual([0, 0, 0]);
+        expect(eskf.bg).toEqual([0, 0, 0]);
     });
 
     it("mag factor updates m_earth toward measurement", () => {
