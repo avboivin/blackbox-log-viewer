@@ -170,16 +170,20 @@ export function ingestFlightLog(flightLog, opts = {}) {
             }
 
             // ---- FC Quaternion ----
-            // Betaflight logs the attitude quaternion body(FRD)→world(NED).
-            // The Euler extraction in the firmware uses a left-handed yaw formula
-            // (yaw = -atan2(R[1][0], R[0][0])) which gives the correct geographic
-            // heading but does NOT match the quaternion's own atan2(R[1][0],R[0][0]).
-            // The quaternion's w≥0 constraint (stored as int16 components, qw≥0
-            // forced) creates a shortest-path wrap that flips the yaw sign.
+            // Betaflight logs the attitude quaternion body(FRD)→world(NED),
+            // Hamilton scalar-first [w,x,y,z]. The quaternion components are stored
+            // as int16 scaled by 1/32767; qw is reconstructed from the unit-norm
+            // constraint qw = √(1 − qx² − qy² − qz²) with qw ≥ 0.
             //
-            // Fix: extract (roll, pitch, heading) using Betaflight's exact formulas,
-            // then rebuild a standard right-handed ZYX quaternion for the estimator.
-            // This preserves roll/pitch while giving correct geographic heading.
+            // CONVENTION FIX (2026-06-15): Betaflight applies the quaternion as
+            //   v_world = q_bf* ⊗ v_body ⊗ q_bf
+            // while our ESKF uses the standard Hamilton product:
+            //   v_world = q_our ⊗ v_body ⊗ q_our*
+            // The same numeric quaternion produces opposite rotations in these two
+            // conventions. The fix: conjugate the BF quaternion to convert between
+            // conventions (q_our = q_bf*), then extract Euler using standard formulas.
+            // The BF yaw formula (−atan2) compensates for the conjugate's yaw flip
+            // while producing correct pitch/roll signs for the FRD/NED frame.
             if (hasQuat) {
                 const qx = frame[idxQuat[0]] / 32767;
                 const qy = frame[idxQuat[1]] / 32767;
@@ -191,15 +195,14 @@ export function ingestFlightLog(flightLog, opts = {}) {
                 } else {
                     qw = 0;
                 }
-                // Build rotation matrix from the logged quaternion
-                const R = quatToRot([qw, qx, qy, qz]);
-                // Extract Euler using Betaflight's exact formulas (imu.c)
-                const roll = Math.atan2(R[2][1], R[2][2]);
-                const pitch = -Math.asin(Math.max(-1, Math.min(1, R[2][0])));
-                let heading = -Math.atan2(R[1][0], R[0][0]);
-                if (heading < 0) heading += 2 * Math.PI;
-                // Rebuild with standard ZYX eulerToQuat (right-handed heading)
-                const qFixed = eulerToQuat(roll, pitch, heading);
+                // Partial conjugate: negate qy (pitch) and qz (yaw) from raw quaternion.
+                // qx (roll) must NOT be negated — the full conjugate [qw,-qx,-qy,-qz]
+                // inverts east/west permanently (dead end: §42.13). The un-negated qx
+                // creates a roll-coupling artifact during banked turns, cured by
+                // skipping the quat-prior entirely during high-rate maneuvers
+                // (estimatorLoop.js sharp-turn gate). Pitch and yaw are correct in
+                // both static and dynamic conditions with this combination.
+                const qFixed = [qw, qx, -qy, -qz];
                 quat.push({ tUs, q: qFixed });
             }
 

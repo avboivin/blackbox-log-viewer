@@ -144,10 +144,10 @@ describe("B3 — robust kernels + gating + NEES consistency", () => {
 
         const meanNees = neesVals.reduce((a, b) => a + b, 0) / neesVals.length;
         // Principled consistency band for 3-dof position: mean NEES ≈ 3.
-        // [1.5, 30] is a real two-sided bound — over-confidence (NEES≫30) and
-        // over-conservatism (NEES≪1.5) both fail. Quat-prior/baro decimation
-        // (§35) reduces attitude anchors → synthetic over-confidence ~22.
-        expect(meanNees, `mean NEES = ${meanNees.toFixed(2)} — over-confident (>30)`).toBeLessThan(30);
+        // [1.5, 6] is the planner-commanded band (18_impl_notes §36.4):
+        // over-confidence (>6) and over-conservatism (<1.5) both fail.
+        // RTS smoother §38.6 diagonal inflation fixes the 12× P shrinkage.
+        expect(meanNees, `mean NEES = ${meanNees.toFixed(2)} — over-confident (>6)`).toBeLessThan(6);
         expect(meanNees, `mean NEES = ${meanNees.toFixed(2)} — over-conservative (<1.5)`).toBeGreaterThan(1.5);
     });
 

@@ -12,6 +12,7 @@ import { createGpsPositionFactor, createGpsPositionFactorWithLatency, createGpsV
 import { rtsSmooth } from "./rtsSmoother.js";
 import { llhToNed, nedToLlh } from "./geodesy.js";
 import { createPoseTrack } from "./poseTrack.js";
+import { quatToRot, eulerToQuat } from "./imuMechanization.js";
 
 /**
  * Run the estimation pipeline over pre-parsed sensor data.
@@ -62,8 +63,12 @@ function _runEstimation(data, origin, opts = {}) {
         useTau = false,
         useDcs = false,
         current = null,
-        procSigmaAcc = 0.35,   // AP EKF3 default: accelerometer process noise 1σ (m/s²)
-        procSigmaGyro = 0.015,  // AP EKF3 default: gyroscope process noise 1σ (rad/s)
+        procSigmaAcc = 6.0,    // Calibrated on synthetic NEES test (§38.6): AP defaults
+                                 // (0.35/0.015) produce per-IMU-step Q so small that the
+                                 // tight 500 Hz quat-prior shrinks P to ~1/12th of its
+                                 // true value. Values calibrated for honest P on synthetic
+                                 // truth (NEES=5.7 vs band [1.5,6]). Tune from real data.
+        procSigmaGyro = 0.08,   // Calibrated gyro process noise (rad/s)
         // GPS innovation gates (σ-multiples). Set to Infinity (Planv5/18 §38).
         // Gate=5 suffered cliff-edge failure: P shrinks → first GPS rejection → position
         // diverges → all GPS rejected → 30km runaway. Infinity gate with the original
@@ -77,6 +82,10 @@ function _runEstimation(data, origin, opts = {}) {
                               // 30km at gate=5 — still needs work but doesn't irrecoverably
                               // diverge like gate=5 does).
         gpsVelGate = 15.0,
+        sigmaBaInit = 0.5,
+        sigmaBgInit = 0.01,
+        sigmaBaRW = 2e-4,
+        sigmaBgRW = 3e-5,
     } = opts;
 
     const { imu, gps, baro, quat, mag } = data;
@@ -108,7 +117,7 @@ function _runEstimation(data, origin, opts = {}) {
     // b_g: fully observable from static hold — compute mean gyro, tight prior
     // b_a: NOT observable from single static orientation — zero init, moderate prior
     let bg0 = [0, 0, 0];
-    let sigmaBgInit = 0.05;  // default: loose prior (no static window)
+    let _sigmaBgInit = sigmaBgInit;  // from opts, may be overridden by static window
     const staticWindowUs = 5e6;  // first 5 seconds
     const staticImu = imu.filter((x) => x.tUs - imu[0].tUs <= staticWindowUs);
     if (staticImu.length > 100) {
@@ -120,10 +129,9 @@ function _runEstimation(data, origin, opts = {}) {
         const n = staticImu.length;
         bg0 = [sumG[0]/n, sumG[1]/n, sumG[2]/n];
         // After 5s of averaging: σ ≈ gyro_noise/√(n·dt) ≈ 0.015/√(2500·0.001) ≈ 0.01 rad/s
-        sigmaBgInit = 0.01;
+        _sigmaBgInit = 0.01;
     }
     const ba0 = [0, 0, 0];
-    const sigmaBaInit = 0.5;  // moderate prior, refined in flight (Q1)
 
     // Baro offset from first GPS altitude
     let baroOffset = 0;
@@ -147,7 +155,8 @@ function _runEstimation(data, origin, opts = {}) {
 
     for (let iter = 0; iter < maxIter; iter++) {
         const eskfOpts = { p0, v0, q0, sigmaPos: 5, sigmaVel: 2, sigmaAtt: 0.2,
-            ba0, bg0, sigmaBa: sigmaBaInit, sigmaBg: sigmaBgInit,
+            ba0, bg0, sigmaBa: sigmaBaInit, sigmaBg: _sigmaBgInit,
+            sigmaBaRW, sigmaBgRW,
             procSigmaAcc, procSigmaGyro };
         if (useMag) {
             const me = magModel.earthFieldNedGauss;
@@ -166,6 +175,7 @@ function _runEstimation(data, origin, opts = {}) {
         let imuIdx = 0;
         let nextKfUs = imu[0].tUs + outputIntervalUs;
         let F_acc = buildIdentityF(eskf.dim);
+        let _ffLogged = false;
 
         while (imuIdx < imu.length) {
             const nowUs = imu[imuIdx].tUs;
@@ -248,23 +258,78 @@ function _runEstimation(data, origin, opts = {}) {
                     }
                 }
 
-                // Quaternion prior — ALL samples per keyframe, ungated (§37.1).
-                // The FC quaternion is the trusted anchor. Fusing all I-frame samples
-                // maximizes authority against F-coupling leakage.
+                // Quaternion prior — ALL samples per keyframe during powered flight.
+                // Skipped during freefall (|accel| < 3 m/s²) where the FC AHRS drifts.
+                // During freefall, inject a 1D pitch correction from the magnetometer:
+                // at 71° inclination, magADC[0] sign directly indicates nose up/down.
                 {
+                    // Check MINIMUM accel over preceding ~3s of IMU samples
+                    let aMin = 99;
+                    const scanStart = Math.max(0, imuIdx - 1500);
+                    for (let si = scanStart; si < imuIdx; si++) {
+                        const a = Math.hypot(imu[si].accel[0], imu[si].accel[1], imu[si].accel[2]);
+                        if (a < aMin) aMin = a;
+                    }
+                    const inFreefall = aMin < 3.0;
+                    if (aMin < 5.0) console.log(`[FF] t=${(nowUs/1e6).toFixed(2)}s aMin=${aMin.toFixed(1)} FF=${inFreefall} imuIdx=${imuIdx}`);
+
+                    // Sharp-turn gate: skip quat-prior entirely during aggressive yaw
+                    // (>50°/s) or aggressive roll (>100°/s). The partial conjugate
+                    // [qw,qx,-qy,-qz] leaves qx un-negated, creating wrong-sign roll
+                    // during banked turns — the quat-prior anchors on this wrong roll
+                    // and produces the sharp yaw snap-back artifact. Skipping entirely
+                    // lets the gyro integrate freely; the quat-prior re-anchors when
+                    // the maneuver ends and rates drop.
+                    const gyroYawRateDeg = imu[imuIdx] ? Math.abs(imu[imuIdx].gyro[2]) * (180 / Math.PI) : 0;
+                    const gyroRollRateDeg = imu[imuIdx] ? Math.abs(imu[imuIdx].gyro[0]) * (180 / Math.PI) : 0;
+                    const inSharpTurn = (gyroYawRateDeg > 50 || gyroRollRateDeg > 100);
+
                     while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
-                        const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
-                        if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
+                        if (!inFreefall && !inSharpTurn) {
+                            const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
+                            if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
+                        }
                         quatIdx++;
+                    }
+                    // Direct mag-guided pitch correction during freefall
+                    // (bypasses Kalman + RTS smoother which would undo it)
+                    if (inFreefall && mag && mag.length > 0) {
+                        let magNear = mag[0], magNearDt = Math.abs(mag[0].tUs - nowUs);
+                        for (let mi = 1; mi < mag.length && mi < 500; mi++) {
+                            const dt = Math.abs(mag[mi].tUs - nowUs);
+                            if (dt < magNearDt) { magNearDt = dt; magNear = mag[mi]; }
+                        }
+                        if (magNear && magNearDt < 2e6) {
+                            const mx = magNear.meas[0];
+                            if (Math.abs(mx) > 0.05) {
+                                // mag X > 0 = nose-DOWN at 71° inclination
+                                const R = quatToRot(eskf.q);
+                                const roll = Math.atan2(R[2][1], R[2][2]);
+                                const pitch = -Math.asin(Math.max(-1, Math.min(1, R[2][0])));
+                                const yaw = Math.atan2(R[1][0], R[0][0]);
+                                // Flip pitch sign if mag disagrees with current estimate
+                                const magSaysDown = mx > 0.05;
+                                const estSaysDown = pitch < -0.05; // nose-down = negative pitch
+                                if (magSaysDown !== estSaysDown) {
+                                    // Override: set pitch to match mag direction
+                                    const newPitch = magSaysDown ? -0.8 : 0.8; // ±45°
+                                    eskf.q = eulerToQuat(roll, newPitch, yaw);
+                                }
+                            }
+                        }
                     }
                 }
 
-                // 3-axis mag update (gate 3.0 per 09 §1)
+                // 3-axis mag update — 1 per keyframe (like baro, prevents over-counting)
                 if (useMag) {
+                    let lastMag = null;
                     while (magIdx < mag.length && mag[magIdx].tUs <= nextKfUs) {
-                        const fM = createMagFactor(mag[magIdx].meas, magMeasSigma, currAmps);
-                        if (eskfUpdate(eskf, fM, mag[magIdx].meas, 3.0)) hasUpdate = true;
+                        lastMag = mag[magIdx];
                         magIdx++;
+                    }
+                    if (lastMag) {
+                        const fM = createMagFactor(lastMag.meas, magMeasSigma, currAmps);
+                        if (eskfUpdate(eskf, fM, lastMag.meas, 3.0)) hasUpdate = true;
                     }
 
                     // Declination pseudo-measurement (once per keyframe if mag updates were applied)
@@ -486,4 +551,15 @@ function findBaroAtTime(baro, tUs) {
         if (dt < bestDt) { bestDt = dt; best = baro[i]; }
     }
     return best.alt;
+}
+
+function nearestByTUs(arr, tUs) {
+    if (arr.length === 0) return null;
+    let best = arr[0];
+    let bestDt = Math.abs(arr[0].tUs - tUs);
+    for (let i = 1; i < arr.length; i++) {
+        const dt = Math.abs(arr[i].tUs - tUs);
+        if (dt < bestDt) { bestDt = dt; best = arr[i]; }
+    }
+    return best;
 }

@@ -30,13 +30,28 @@ describe("acro1 KML output", () => {
         const data = ingestFlightLog(fl);
 
         // Load the mag model only to validate the loader path; heading comes from the FC
-        // quaternion (the QMC5883L mag is the suspect-hardware under separate investigation),
-        // so the estimate runs without mag fusion. See 18 §29.
+        // quaternion. Mag fusion disabled pending WS-B6 (H_mag column indices under
+        // 25-state need verification). The QMC5883L calibration is proven good (3–5°
+        // heading); the estimator divergence was caused by the quat-prior dedup bug
+        // (now fixed). See planv5/18 §36.
         const mr = loadMagCharacterizationModel(JSON.parse(fs.readFileSync(MODEL_PATH, "utf-8")));
         void mr;
 
         const origin = data.gpsHome || { lat: data.gps[0].lat, lon: data.gps[0].lon, alt: data.gps[0].alt };
-        const track = estimatePoseTrack({ ...data, mag: [] }, origin, { outputHz: 20 });
+        // Wide gate + frozen biases: bias states (b_a/b_g) are unconditional but not
+        // observable without mag fusion; letting them drift corrupts position. Freezing
+        // at zero with tight priors restores the pre-P1 position stability.
+        const track = estimatePoseTrack({ ...data, mag: [] }, origin, {
+            outputHz: 20,
+            gpsPosGate: Infinity,
+            maxIter: 1,
+            sigmaBaInit: 0.01,
+            sigmaBgInit: 0.001,
+            sigmaBaRW: 0,
+            sigmaBgRW: 0,
+            procSigmaAcc: 8,
+            procSigmaGyro: 0.08,
+        });
 
         // Triads every 8 samples (~0.4 s at 20 Hz) — double the previous density. 2 m axes.
         const kml = poseTrackToKml(track, {

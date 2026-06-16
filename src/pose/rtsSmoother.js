@@ -462,15 +462,36 @@ export function rtsSmooth(filterResults, transitionMatrices) {
     // State update: δx = C_k · (x_{k+1|N} ⊖ x_{k+1|k})
     const deltaNext = stateDifference(xkp1Smoothed, xkp1Pred);
     const deltaX = matrixVectorMultiply(Ck, deltaNext);
+
+    // Capture the attitude corrections we're about to suppress (§38.6)
+    const omittedDx = deltaX[6];
+    const omittedDy = deltaX[7];
+    const omittedDz = deltaX[8];
+
     // Zero δθ: quat-prior anchors attitude; smoother must not undo it via F-coupling (§37.1)
     deltaX[6] = 0; deltaX[7] = 0; deltaX[8] = 0;
+
     smoothed[k] = {
       x: stateAdd(filterResults[k].x, deltaX),
       P: (function () {
         const dP = matrixSub(Pkp1Smoothed, Pkp1Pred);
         const CdP = matrixMultiply(Ck, dP);
         const CdPCt = matrixMultiply(CdP, matrixTranspose(Ck));
-        return matrixAdd(Pk, CdPCt);
+        const P_new = matrixAdd(Pk, CdPCt);
+
+        // Inflate attitude diagonals to prevent artificial shrinkage:
+        //  1. Reset to forward-pass baseline Pk (undoes dP contribution
+        //     that assumes δθ was corrected, when it was suppressed)
+        //  2. Add omitted correction squared (accounts for unapplied
+        //     error the smoother identified but chose not to fix)
+        // The forward-pass Q (calibrated procSigmaAcc=6, procSigmaGyro=0.08)
+        // keeps position/velocity P honest; these lines prevent the
+        // smoother from making them over-confident.
+        P_new[6][6] = Pk[6][6] + (omittedDx * omittedDx);
+        P_new[7][7] = Pk[7][7] + (omittedDy * omittedDy);
+        P_new[8][8] = Pk[8][8] + (omittedDz * omittedDz);
+
+        return P_new;
       })(),
     };
   }

@@ -285,14 +285,15 @@ export function createEskf({ p0, v0, q0, sigmaPos = 5, sigmaVel = 2, sigmaAtt = 
         tauGps: hasTau ? tauGps0 : null,
         kI: hasKI ? kI0.slice() : null,
         P,
-        // Process noise. Defaults ARE the principled ArduPilot EKF3 values
-        // (ACC_P_NSE = 0.35 m/s², GYRO_P_NSE = 0.015 rad/s). These are now safe
-        // because b_a/b_g bias states are unconditional (Task A, Q3) — biases absorb
-        // real-FC vibration rather than needing inflated process noise to compensate.
+        // Process noise. Defaults calibrated on synthetic NEES truth (§38.6):
+        // procSigmaAcc=6.0, procSigmaGyro=0.08. The AP EKF3 values (0.35/0.015)
+        // were too small for this filter: the 500 Hz quat-prior shrinks P_θ to
+        // ~attSigma² every step, and per-IMU-step Q (∝ dt²) cannot grow it back.
         // The old band-aid (sigmaAcc=8, sigmaGyro=0.08) was necessary without bias
-        // states (see planv5/18 §28) and is retired. The caller (estimatorLoop.js)
-        // passes these defaults; they can be overridden for special cases.
-        // See planv5/18 §32 (Q3, Q1) and §33.1 (Task C recalibration).
+        // states (planv5/18 §28) — the calibrated values are similar for a deeper
+        // reason: tight quat-prior anchoring needs compensating process noise.
+        // The caller (estimatorLoop.js) passes these defaults; override for tuning.
+        // See planv5/18 §38.6 (NEES calibration) and §32 (Q3, Q1).
         sigmaAcc: procSigmaAcc,
         sigmaGyro: procSigmaGyro,
         sigmaBaRW,
