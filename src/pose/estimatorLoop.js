@@ -53,7 +53,11 @@ function _runEstimation(data, origin, opts = {}) {
         gpsPosSigma = 2.5,
         gpsVelSigma = 0.5,
         baroSigma = 1.0,
-        attSigma = 0.02,  // §37.1: tight quat-prior with all-samples-per-keyframe
+        attSigma = 0.02,  // Fix 3 anisotropic: σ_tilt=0.02 rad (gravity-bounded FC tilt ~1°)
+        sigmaYaw = 0.025, // Fix 3: σ_yaw=0.025 rad (~1.4°). Minimal anisotropy — 1.25× looser
+                           //   than tilt (σ=0.02). Empirically calibrated: 0.03→back_flip 149°
+                           //   (1° short), 0.05→orbit crab marginal, 0.50→heading runaway.
+                           //   With mag fusion (Fix 5), σ_yaw widens to 0.50.
         maxIter = 3,
         magSigma = 0.05,
         declSigma = 0.34,
@@ -271,7 +275,7 @@ function _runEstimation(data, origin, opts = {}) {
                 // exists. The quat-prior is un-gated (gate = Infinity).
                 // See planv5/15 §5, 18 §1.3 / §2.2.
                 while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
-                    const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
+                    const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma, sigmaYaw);
                     if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
                     quatIdx++;
                 }

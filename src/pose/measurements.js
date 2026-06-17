@@ -208,36 +208,60 @@ export function createBaroFactor(baroAlt, baroOffset, sigma = 1.0) {
 /**
  * Quaternion attitude prior (soft prior from FC fused attitude).
  *
+ * Supports both isotropic (single sigma) and anisotropic (sigmaTilt + sigmaYaw)
+ * noise models. In anisotropic mode, the measurement covariance R is the
+ * body-frame noise diag(σ_tilt², σ_tilt², σ_yaw²) rotated to the world frame
+ * of the residual:  R_world = R_bw · R_body · R_bwᵀ  (Fix 3, planv5/06 §9).
+ * The FC's tilt is gravity-bounded (~1°); yaw is gyro-only dead-reckoned
+ * (drifting 10–30°/flight). The anisotropic R lets the quat-prior and mag
+ * factor coexist: the prior owns tilt, the mag owns yaw.
+ *
  * @param {[number,number,number,number]} qMeas  Measured quaternion [w,x,y,z] scalar-first
- * @param {number} [sigma=0.1]  1σ noise in radians
+ * @param {number} [sigmaTilt=0.1]  1σ noise for tilt axes (roll, pitch) in radians
+ * @param {number} [sigmaYaw=null]  1σ noise for yaw axis in radians. If null,
+ *                                   isotropic mode: all axes use sigmaTilt.
  */
-export function createQuaternionPrior(qMeas, sigma = 0.1) {
-  const varQ = sigma * sigma;
+export function createQuaternionPrior(qMeas, sigmaTilt = 0.1, sigmaYaw = null) {
+  const anisotropic = (sigmaYaw !== null && sigmaYaw !== sigmaTilt);
 
-  // h(x) — not used directly for residual; residual computed via log map
-  function h(x) {
-    return x.q.slice();  // return [w,x,y,z]
-  }
-
-  // H = [0_3, 0_3, I3]
+  // H = [0_3, 0_3, I3] — world-frame attitude residual Jacobian (unchanged)
   const H = [
     [0, 0, 0,  0, 0, 0,  1, 0, 0],
     [0, 0, 0,  0, 0, 0,  0, 1, 0],
     [0, 0, 0,  0, 0, 0,  0, 0, 1],
   ];
 
-  const R = [
-    [varQ,    0,    0],
-    [   0, varQ,    0],
-    [   0,    0, varQ],
-  ];
+  let R;
+  if (anisotropic) {
+    // Anisotropic: R_world = R_bw · R_body · R_bwᵀ
+    // R_body = diag(σ_tilt², σ_tilt², σ_yaw²)
+    // R_bw = quatToRot(qMeas) — body-to-world rotation from the measurement
+    const varTilt = sigmaTilt * sigmaTilt;
+    const varYaw = sigmaYaw * sigmaYaw;
+    const Rbody = [[varTilt, 0, 0], [0, varTilt, 0], [0, 0, varYaw]];
+
+    // Get R_bw as 2D 3×3
+    const m = quatToRotMat(qMeas);  // flat 9-element
+    const Rbw = [[m[0], m[1], m[2]], [m[3], m[4], m[5]], [m[6], m[7], m[8]]];
+    // Rbwᵀ
+    const RbwT = [[m[0], m[3], m[6]], [m[1], m[4], m[7]], [m[2], m[5], m[8]]];
+
+    // R_temp = R_bw · R_body
+    const Rtemp = matMul3x3(Rbw, Rbody);
+    // R_world = R_temp · R_bwᵀ
+    R = matMul3x3(Rtemp, RbwT);
+  } else {
+    const varQ = sigmaTilt * sigmaTilt;
+    R = [[varQ, 0, 0], [0, varQ, 0], [0, 0, varQ]];
+  }
+
+  // h(x) — not used directly for residual; residual computed via log map
+  function h(x) {
+    return x.q.slice();
+  }
 
   function residual(z, x) {
     // GLOBAL (world-frame) attitude residual:  r = logMap( R_meas · R_state^T ).
-    // With q_true = δq(δθ_world) ⊗ q̂, ∂r/∂δθ_world = −I, so H = [0,0,I] is exact.
-    // qMeas ⊗ q_state*  gives R_meas · R_state^T.
-    // (The previous 2·logMap(R_meas^T·R_state) was the BODY-frame error with a
-    //  spurious factor of 2 — inconsistent with the global injection. FD-verified.)
     const qRel = quatMultiply(qMeas, quatConjugate(x.q));
     const Rrel = quatToRotMat(qRel);
     const omega = logMap(Rrel);
@@ -245,6 +269,18 @@ export function createQuaternionPrior(qMeas, sigma = 0.1) {
   }
 
   return { h, H, R, residual };
+}
+
+/**
+ * 3×3 matrix multiply (inline helper for anisotropic R construction).
+ */
+function matMul3x3(A, B) {
+    const C = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let i = 0; i < 3; i++)
+        for (let k = 0; k < 3; k++)
+            for (let j = 0; j < 3; j++)
+                C[i][j] += A[i][k] * B[k][j];
+    return C;
 }
 
 /**
