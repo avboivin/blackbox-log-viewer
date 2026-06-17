@@ -12,7 +12,6 @@ import { createGpsPositionFactor, createGpsPositionFactorWithLatency, createGpsV
 import { rtsSmooth } from "./rtsSmoother.js";
 import { llhToNed, nedToLlh } from "./geodesy.js";
 import { createPoseTrack } from "./poseTrack.js";
-import { quatToRot, eulerToQuat } from "./imuMechanization.js";
 
 /**
  * Run the estimation pipeline over pre-parsed sensor data.
@@ -175,7 +174,6 @@ function _runEstimation(data, origin, opts = {}) {
         let imuIdx = 0;
         let nextKfUs = imu[0].tUs + outputIntervalUs;
         let F_acc = buildIdentityF(eskf.dim);
-        let _ffLogged = false;
 
         while (imuIdx < imu.length) {
             const nowUs = imu[imuIdx].tUs;
@@ -258,66 +256,17 @@ function _runEstimation(data, origin, opts = {}) {
                     }
                 }
 
-                // Quaternion prior — ALL samples per keyframe during powered flight.
-                // Skipped during freefall (|accel| < 3 m/s²) where the FC AHRS drifts.
-                // During freefall, inject a 1D pitch correction from the magnetometer:
-                // at 71° inclination, magADC[0] sign directly indicates nose up/down.
-                {
-                    // Check MINIMUM accel over preceding ~3s of IMU samples
-                    let aMin = 99;
-                    const scanStart = Math.max(0, imuIdx - 1500);
-                    for (let si = scanStart; si < imuIdx; si++) {
-                        const a = Math.hypot(imu[si].accel[0], imu[si].accel[1], imu[si].accel[2]);
-                        if (a < aMin) aMin = a;
-                    }
-                    const inFreefall = aMin < 3.0;
-                    if (aMin < 5.0) console.log(`[FF] t=${(nowUs/1e6).toFixed(2)}s aMin=${aMin.toFixed(1)} FF=${inFreefall} imuIdx=${imuIdx}`);
-
-                    // Sharp-turn gate: skip quat-prior entirely during aggressive yaw
-                    // (>50°/s) or aggressive roll (>100°/s). The partial conjugate
-                    // [qw,qx,-qy,-qz] leaves qx un-negated, creating wrong-sign roll
-                    // during banked turns — the quat-prior anchors on this wrong roll
-                    // and produces the sharp yaw snap-back artifact. Skipping entirely
-                    // lets the gyro integrate freely; the quat-prior re-anchors when
-                    // the maneuver ends and rates drop.
-                    const gyroYawRateDeg = imu[imuIdx] ? Math.abs(imu[imuIdx].gyro[2]) * (180 / Math.PI) : 0;
-                    const gyroRollRateDeg = imu[imuIdx] ? Math.abs(imu[imuIdx].gyro[0]) * (180 / Math.PI) : 0;
-                    const inSharpTurn = (gyroYawRateDeg > 50 || gyroRollRateDeg > 100);
-
-                    while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
-                        if (!inFreefall && !inSharpTurn) {
-                            const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
-                            if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
-                        }
-                        quatIdx++;
-                    }
-                    // Direct mag-guided pitch correction during freefall
-                    // (bypasses Kalman + RTS smoother which would undo it)
-                    if (inFreefall && mag && mag.length > 0) {
-                        let magNear = mag[0], magNearDt = Math.abs(mag[0].tUs - nowUs);
-                        for (let mi = 1; mi < mag.length && mi < 500; mi++) {
-                            const dt = Math.abs(mag[mi].tUs - nowUs);
-                            if (dt < magNearDt) { magNearDt = dt; magNear = mag[mi]; }
-                        }
-                        if (magNear && magNearDt < 2e6) {
-                            const mx = magNear.meas[0];
-                            if (Math.abs(mx) > 0.05) {
-                                // mag X > 0 = nose-DOWN at 71° inclination
-                                const R = quatToRot(eskf.q);
-                                const roll = Math.atan2(R[2][1], R[2][2]);
-                                const pitch = -Math.asin(Math.max(-1, Math.min(1, R[2][0])));
-                                const yaw = Math.atan2(R[1][0], R[0][0]);
-                                // Flip pitch sign if mag disagrees with current estimate
-                                const magSaysDown = mx > 0.05;
-                                const estSaysDown = pitch < -0.05; // nose-down = negative pitch
-                                if (magSaysDown !== estSaysDown) {
-                                    // Override: set pitch to match mag direction
-                                    const newPitch = magSaysDown ? -0.8 : 0.8; // ±45°
-                                    eskf.q = eulerToQuat(roll, newPitch, yaw);
-                                }
-                            }
-                        }
-                    }
+                // Quaternion prior — ALL samples per keyframe, UNCONDITIONAL.
+                // The FC fused quaternion is the trusted attitude anchor (raw verbatim
+                // ingestion, Fix 1). The binary freefall/sharp-turn gates and the
+                // hardcoded mag-guided pitch override were removed (Fix 2): they were
+                // band-aids for the partial-conjugate roll/pitch artifact that no longer
+                // exists. The quat-prior is un-gated (gate = Infinity).
+                // See planv5/15 §5, 18 §1.3 / §2.2.
+                while (quatIdx < quat.length && quat[quatIdx].tUs <= nextKfUs) {
+                    const fQ = createQuaternionPrior(quat[quatIdx].q, attSigma);
+                    if (eskfUpdate(eskf, fQ, quat[quatIdx].q, Infinity)) hasUpdate = true;
+                    quatIdx++;
                 }
 
                 // 3-axis mag update — 1 per keyframe (like baro, prevents over-counting)
@@ -551,15 +500,4 @@ function findBaroAtTime(baro, tUs) {
         if (dt < bestDt) { bestDt = dt; best = baro[i]; }
     }
     return best.alt;
-}
-
-function nearestByTUs(arr, tUs) {
-    if (arr.length === 0) return null;
-    let best = arr[0];
-    let bestDt = Math.abs(arr[0].tUs - tUs);
-    for (let i = 1; i < arr.length; i++) {
-        const dt = Math.abs(arr[i].tUs - tUs);
-        if (dt < bestDt) { bestDt = dt; best = arr[i]; }
-    }
-    return best;
 }

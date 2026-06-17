@@ -161,14 +161,18 @@ function buildTransition(dim, q, sfAccel, dt) {
     F[6][12]=-dt*R[0][0];  F[6][13]=-dt*R[0][1];  F[6][14]=-dt*R[0][2];
     F[7][12]=-dt*R[1][0];  F[7][13]=-dt*R[1][1];  F[7][14]=-dt*R[1][2];
     F[8][12]=-dt*R[2][0];  F[8][13]=-dt*R[2][1];  F[8][14]=-dt*R[2][2];
-    // δv ← δb_a = −R·dt   (accel bias rotated into world-frame vel error)
-    F[3][9]=-dt*R[0][0];   F[3][10]=-dt*R[0][1];   F[3][11]=-dt*R[0][2];
-    F[4][9]=-dt*R[1][0];   F[4][10]=-dt*R[1][1];   F[4][11]=-dt*R[1][2];
-    F[5][9]=-dt*R[2][0];   F[5][10]=-dt*R[2][1];   F[5][11]=-dt*R[2][2];
-    // δp ← δb_a = −R·½dt²  (accel bias double-integrates into position error)
-    F[0][9]=-dt2h*R[0][0]; F[0][10]=-dt2h*R[0][1]; F[0][11]=-dt2h*R[0][2];
-    F[1][9]=-dt2h*R[1][0]; F[1][10]=-dt2h*R[1][1]; F[1][11]=-dt2h*R[1][2];
-    F[2][9]=-dt2h*R[2][0]; F[2][10]=-dt2h*R[2][1]; F[2][11]=-dt2h*R[2][2];
+    // δv ← δb_a = +R·dt   (accel bias rotated into world-frame vel error)
+    // SIGN: strapdown uses specific force f = −(accel − b_a) = −accel + b_a, so
+    // ∂v⁺/∂b_a = +R·dt (the accel-negation flips the sign vs the gyro-bias case,
+    // where ω_corr = ω − b_g gives −R·dt). Using −R·dt mis-signs the bias↔vel
+    // cross-covariance → the filter corrects b_a the WRONG way → bias divergence.
+    F[3][9]=dt*R[0][0];   F[3][10]=dt*R[0][1];   F[3][11]=dt*R[0][2];
+    F[4][9]=dt*R[1][0];   F[4][10]=dt*R[1][1];   F[4][11]=dt*R[1][2];
+    F[5][9]=dt*R[2][0];   F[5][10]=dt*R[2][1];   F[5][11]=dt*R[2][2];
+    // δp ← δb_a = +R·½dt²  (accel bias double-integrates into position error)
+    F[0][9]=dt2h*R[0][0]; F[0][10]=dt2h*R[0][1]; F[0][11]=dt2h*R[0][2];
+    F[1][9]=dt2h*R[1][0]; F[1][10]=dt2h*R[1][1]; F[1][11]=dt2h*R[1][2];
+    F[2][9]=dt2h*R[2][0]; F[2][10]=dt2h*R[2][1]; F[2][11]=dt2h*R[2][2];
     }
     // b_a ← b_a = I,  b_g ← b_g = I  (already set by matIdentity; bias is Brownian)
 

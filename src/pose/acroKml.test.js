@@ -38,19 +38,16 @@ describe("acro1 KML output", () => {
         void mr;
 
         const origin = data.gpsHome || { lat: data.gps[0].lat, lon: data.gps[0].lon, alt: data.gps[0].alt };
-        // Wide gate + frozen biases: bias states (b_a/b_g) are unconditional but not
-        // observable without mag fusion; letting them drift corrupts position. Freezing
-        // at zero with tight priors restores the pre-P1 position stability.
+        // Default settings — biases observable, normal 15σ GPS gate. The previous
+        // "wide gate + frozen biases" workaround was a band-aid for a sign error in the
+        // accel-bias→velocity transition Jacobian (eskf.js buildTransition): F[v][b_a]
+        // was −R·dt but the strapdown's f = −(accel − b_a) gives ∂v⁺/∂b_a = +R·dt, so
+        // the filter corrected b_a the wrong way and the trajectory ran away to ~64 km.
+        // With the sign corrected, b_a/b_g converge and the trajectory tracks GPS without
+        // freezing biases or disabling the gate.
         const track = estimatePoseTrack({ ...data, mag: [] }, origin, {
             outputHz: 20,
-            gpsPosGate: Infinity,
             maxIter: 1,
-            sigmaBaInit: 0.01,
-            sigmaBgInit: 0.001,
-            sigmaBaRW: 0,
-            sigmaBgRW: 0,
-            procSigmaAcc: 8,
-            procSigmaGyro: 0.08,
         });
 
         // Triads every 8 samples (~0.4 s at 20 Hz) — double the previous density. 2 m axes.

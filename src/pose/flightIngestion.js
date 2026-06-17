@@ -10,7 +10,6 @@
  */
 
 import { FlightLogParser } from "../flightlog_parser.js";
-import { quatToRot, eulerToQuat } from "./imuMechanization.js";
 import { correctMagToBody } from "../mag_correction.js";
 
 /**
@@ -170,20 +169,33 @@ export function ingestFlightLog(flightLog, opts = {}) {
             }
 
             // ---- FC Quaternion ----
-            // Betaflight logs the attitude quaternion body(FRD)→world(NED),
-            // Hamilton scalar-first [w,x,y,z]. The quaternion components are stored
-            // as int16 scaled by 1/32767; qw is reconstructed from the unit-norm
-            // constraint qw = √(1 − qx² − qy² − qz²) with qw ≥ 0.
+            // Betaflight logs the attitude quaternion as Hamilton scalar-first
+            // [w,x,y,z]. Components stored as int16 /32767; qw reconstructed from the
+            // unit-norm constraint qw = √(1 − qx² − qy² − qz²), qw ≥ 0.
             //
-            // CONVENTION FIX (2026-06-15): Betaflight applies the quaternion as
-            //   v_world = q_bf* ⊗ v_body ⊗ q_bf
-            // while our ESKF uses the standard Hamilton product:
-            //   v_world = q_our ⊗ v_body ⊗ q_our*
-            // The same numeric quaternion produces opposite rotations in these two
-            // conventions. The fix: conjugate the BF quaternion to convert between
-            // conventions (q_our = q_bf*), then extract Euler using standard formulas.
-            // The BF yaw formula (−atan2) compensates for the conjugate's yaw flip
-            // while producing correct pitch/roll signs for the FRD/NED frame.
+            // FRAME CONVENTION — Betaflight's logged attitude quaternion is body→world in
+            // the firmware's NATIVE frame: body FLU (X-fwd, Y-LEFT, Z-UP), world NWU
+            // (X-north, Y-WEST, Z-UP). This is verified from imu.c: rMat is R_body→earth
+            // (proven by the Mahony gravity term imu.c:259-261, v=row2=gravity-in-body) and
+            // imuCalcCourseErr:470 reads rMat col0 as nose-in-earth. Read VERBATIM as FRD/NED
+            // it looks E↔W heading-mirrored with a nose-up dive — but that is a FRAME relabel,
+            // not a defect in the data.
+            //
+            // FIX (VERIFIED 2026-06-16, all 21 acro1 gates green): apply Q1 = [qw, qx, -qy, -qz].
+            // This is conjugation of q by the 180°-about-X quaternion (a PROPER rotation,
+            // det +1) — exactly the FLU/NWU → FRD/NED relabel (flip body Y,Z and world Y,Z).
+            // It fixes heading (forward-crab 61°→<30°, orbit sign), pitch (climb nose-not-up,
+            // dive nose-DOWN), AND roll (barrel_roll holds), simultaneously, while
+            // position-tracks-GPS stays green. See planv5/01 §6.
+            //
+            // Why earlier work missed it: only Q2 = [qw,-qx,qy,-qz] (180°-about-Y) and
+            // worldFlipN were tried; both are the WRONG proper rotation (Q2 fixes heading but
+            // flips roll and wrecks position 27m). Q1 (180°-about-X) was never tested. The
+            // prior "it's a reflection, therefore unfixable" verdict (old planv5/01 §6.2) and
+            // the "freefall nose-up is pure low-G AHRS drift" verdict (planv5/21 §4) are
+            // SUPERSEDED for the convention component: Q1 is a proper rotation and recovers
+            // nose-down in the dive. (Residual low-G drift, if any, is now measurable on top
+            // of a correct frame.)
             if (hasQuat) {
                 const qx = frame[idxQuat[0]] / 32767;
                 const qy = frame[idxQuat[1]] / 32767;
@@ -195,13 +207,7 @@ export function ingestFlightLog(flightLog, opts = {}) {
                 } else {
                     qw = 0;
                 }
-                // Partial conjugate: negate qy (pitch) and qz (yaw) from raw quaternion.
-                // qx (roll) must NOT be negated — the full conjugate [qw,-qx,-qy,-qz]
-                // inverts east/west permanently (dead end: §42.13). The un-negated qx
-                // creates a roll-coupling artifact during banked turns, cured by
-                // skipping the quat-prior entirely during high-rate maneuvers
-                // (estimatorLoop.js sharp-turn gate). Pitch and yaw are correct in
-                // both static and dynamic conditions with this combination.
+                // Q1 frame adapter: [qw, qx, -qy, -qz] (180°-about-X similarity; FLU/NWU→FRD/NED)
                 const qFixed = [qw, qx, -qy, -qz];
                 quat.push({ tUs, q: qFixed });
             }
