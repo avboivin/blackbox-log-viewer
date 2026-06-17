@@ -143,14 +143,22 @@ function _runEstimation(data, origin, opts = {}) {
 
     // ---- Build keyframe schedule ----
     const outputIntervalUs = 1e6 / outputHz;
-    const hasMag = magModel && magModel.earthFieldNedGauss && mag && mag.length > 0;
-    const useMag = hasMag && magModel.qualityBounds?.bounds_ok !== false;
+    const hasMag = magModel && magModel.fusion?.earthFieldNedGauss && mag && mag.length > 0;
+    const useMag = hasMag && magModel.fusion?.qualityBounds?.bounds_ok !== false;
     let poses = [];
 
-    // Mag noise from model or default
-    const magMeasSigma = useMag && magModel.magNoiseGauss?.sigma != null
-        ? magModel.magNoiseGauss.sigma
+    // Mag noise from model or default. The static calibration residual gives
+    // unrealistically tight sigma (~0.006 G at this site) — actual in-flight
+    // noise is 0.015-0.025 G/axis (motor current, vibration). Enforce a floor
+    // to prevent the chi-square gate from rejecting ~99% of measurements.
+    // (planv5 anisotropic design §2.3, 08 §5)
+    const MIN_INFLIGHT_MAG_SIGMA = 0.02;
+    let magMeasSigma = useMag && magModel.fusion?.magNoiseGauss?.sigma != null
+        ? magModel.fusion.magNoiseGauss.sigma
         : magSigma;
+    if (useMag && magMeasSigma < MIN_INFLIGHT_MAG_SIGMA) {
+        magMeasSigma = MIN_INFLIGHT_MAG_SIGMA;
+    }
 
     for (let iter = 0; iter < maxIter; iter++) {
         const eskfOpts = { p0, v0, q0, sigmaPos: 5, sigmaVel: 2, sigmaAtt: 0.2,
@@ -158,7 +166,7 @@ function _runEstimation(data, origin, opts = {}) {
             sigmaBaRW, sigmaBgRW,
             procSigmaAcc, procSigmaGyro };
         if (useMag) {
-            const me = magModel.earthFieldNedGauss;
+            const me = magModel.fusion.earthFieldNedGauss;
             eskfOpts.mEarth0 = [me.n, me.e, me.d];
             eskfOpts.mBody0 = [0, 0, 0];
         }
@@ -282,10 +290,10 @@ function _runEstimation(data, origin, opts = {}) {
                     }
 
                     // Declination pseudo-measurement (once per keyframe if mag updates were applied)
-                    if (hasUpdate && magModel.earthFieldNedGauss) {
+                    if (hasUpdate && magModel.fusion?.earthFieldNedGauss) {
                         const me = eskf.mEarth;
                         if (me) {
-                            const decl = Math.atan2(magModel.earthFieldNedGauss.e, magModel.earthFieldNedGauss.n);
+                            const decl = Math.atan2(magModel.fusion.earthFieldNedGauss.e, magModel.fusion.earthFieldNedGauss.n);
                             const fD = createDeclinationFactor(decl, declSigma);
                             eskfUpdate(eskf, fD, decl);
                         }
@@ -419,7 +427,7 @@ export function estimatePoseTrack(data, origin, opts = {}) {
                 gpsVelSigma: opts.gpsVelSigma || 0.5,
                 baroSigma: opts.baroSigma || 1.0,
                 attSigma: opts.attSigma || 0.1,
-                useMag: !!(opts.magModel && opts.magModel.earthFieldNedGauss),
+                useMag: !!(opts.magModel && opts.magModel.fusion?.earthFieldNedGauss),
             },
             estimatedParams,
         },
