@@ -66,23 +66,20 @@ function _runEstimation(data, origin, opts = {}) {
         useTau = false,
         useDcs = false,
         current = null,
-        procSigmaAcc = 6.0,    // Calibrated on synthetic NEES test: AP defaults
-                                 // (0.35/0.015) produce per-IMU-step Q so small that the
-                                 // tight 500 Hz quat-prior shrinks P to ~1/12th of its
-                                 // true value. NEES=5.7 at 6.0; 4.0 pushes NEES to 7.8
-                                 // (overconfident → fails NEES gate). Keep at 6.0 until
-                                 // Fix 3 (anisotropic prior) relaxes P_θ and allows
-                                 // tighter Q without collapsing P.
+        procSigmaAcc = 6.0,    // Calibrated on synthetic NEES test. Fix 3 anisotropic prior
+                                 // relaxes P_θ but procSigmaAcc must stay ≥6: 5→NEES 6.74,
+                                 // 4→NEES 7.82 — both overconfident. The tight quat-prior
+                                 // at 500 Hz still dominates Q tuning.
         procSigmaGyro = 0.08,   // Calibrated gyro process noise (rad/s)
         // GPS innovation gates (σ-multiples). Set to Infinity (Planv5/18 §38).
         // Gate=5 suffered cliff-edge failure: P shrinks → first GPS rejection → position
         // diverges → all GPS rejected → 30km runaway. Infinity gate with the original
         // code gives 88m max drift, reconClimb within 2m of baro (89m vs 91m baro),
         // loop closure passes.
-        gpsPosGate = 10.0,  // Tightened 15→10 (prior sweep proved 21/21 + box at 10;
-                              // cliff at 7, safe minimum 10). Lower gate improves outlier
-                              // rejection without triggering the P-shrink runaway.
-                              // With anisotropic prior (Fix 3), revisit lower values.
+        gpsPosGate = 5.0,   // Post-Fix-3 sweep: tightened 10→5. Fix 3 anisotropic prior
+                              // relaxes P_θ enough that the P-shrink cliff moved: gate=5
+                              // no longer triggers GPS-rejection cascade. Verified 21/21
+                              // acro1 + NEES within [1.5,6]. (Pre-Fix-3 cliff was at gate=7.)
         gpsVelGate = 15.0,
         sigmaBaInit = 0.5,
         sigmaBgInit = 0.01,
